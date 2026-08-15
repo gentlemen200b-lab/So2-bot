@@ -15,10 +15,11 @@ from aiogram.types import (
     InlineKeyboardMarkup, InlineKeyboardButton
 )
 
-# Укажите ваш Telegram ID для доступа к админ-панели
+# Telegram ID админа
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
 MAPS_LIST = ["Sandstone", "Province", "Rust", "Dune", "Hanami", "Prison", "Breeze"]
+COUNTRIES = ["🇰🇿 Казахстан", "🇷🇺 Россия", "🇺🇿 Узбекистан", "🇰🇬 Кыргызстан", "🇧🇾 Беларусь", "🇪🇺 Европа"]
 
 queues = {}     # { "5x5_18:00": user_id }
 matches = {}    # { match_id: data }
@@ -36,19 +37,11 @@ def init_db():
             elo INTEGER DEFAULT 1000,
             device TEXT DEFAULT 'Не указано',
             role TEXT DEFAULT 'Универсал',
+            country TEXT DEFAULT '🇰🇿 Казахстан',
             wins INTEGER DEFAULT 0,
             losses INTEGER DEFAULT 0,
             winstreak INTEGER DEFAULT 0,
             is_banned INTEGER DEFAULT 0
-        )
-    """)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS clans (
-            clan_tag TEXT PRIMARY KEY,
-            captain_id INTEGER NOT NULL,
-            captain_game_id TEXT NOT NULL,
-            roster TEXT NOT NULL,
-            elo INTEGER DEFAULT 1000
         )
     """)
     cursor.execute("""
@@ -65,31 +58,46 @@ def init_db():
     conn.commit()
     conn.close()
 
-def add_player(user_id, nickname, game_id, clan_tag, device, role):
+def safe_send_message(bot, user_id, text, **kwargs):
+    """ Безопасная отправка сообщений с защитой от вылета если юзер заблокировал бота """
+    async def _send():
+        try:
+            return await bot.send_message(user_id, text, **kwargs)
+        except Exception as e:
+            logging.error(f"Не удалось отправить сообщение {user_id}: {e}")
+            return None
+    return _send()
+
+def add_player(user_id, nickname, game_id, clan_tag, device, role, country):
     conn = sqlite3.connect("database.db")
     cursor = conn.cursor()
     cursor.execute("""
-        INSERT INTO players (user_id, nickname, game_id, clan_tag, device, role)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO players (user_id, nickname, game_id, clan_tag, device, role, country)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(user_id) DO UPDATE SET
             nickname=excluded.nickname,
             game_id=excluded.game_id,
             clan_tag=excluded.clan_tag,
             device=excluded.device,
-            role=excluded.role
-    """, (user_id, nickname, game_id, clan_tag, device, role))
+            role=excluded.role,
+            country=excluded.country
+    """, (user_id, nickname, game_id, clan_tag, device, role, country))
     conn.commit()
     conn.close()
 
 def get_player(user_id):
     conn = sqlite3.connect("database.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT nickname, game_id, clan_tag, elo, device, role, wins, losses, winstreak, is_banned FROM players WHERE user_id = ?", (user_id,))
+    cursor.execute("SELECT nickname, game_id, clan_tag, elo, device, role, country, wins, losses, winstreak, is_banned FROM players WHERE user_id = ?", (user_id,))
     res = cursor.fetchone()
     conn.close()
     return res
 
 def update_player_field(user_id, field, value):
+    # Безопасное обновление с ограничением разрешенных полей (Защита от SQL Injection)
+    allowed_fields = ["nickname", "game_id", "clan_tag", "device", "role", "country", "is_banned", "elo"]
+    if field not in allowed_fields:
+        return
     conn = sqlite3.connect("database.db")
     cursor = conn.cursor()
     cursor.execute(f"UPDATE players SET {field} = ? WHERE user_id = ?", (value, user_id))
@@ -100,12 +108,9 @@ def record_match_result(winner_id, loser_id, map_name):
     conn = sqlite3.connect("database.db")
     cursor = conn.cursor()
     
-    # Победитель
     cursor.execute("UPDATE players SET elo = elo + 25, wins = wins + 1, winstreak = winstreak + 1 WHERE user_id = ?", (winner_id,))
-    # Проигравший
     cursor.execute("UPDATE players SET elo = MAX(0, elo - 25), losses = losses + 1, winstreak = 0 WHERE user_id = ?", (loser_id,))
     
-    # Получаем ники для истории
     cursor.execute("SELECT nickname FROM players WHERE user_id = ?", (winner_id,))
     w_nick = cursor.fetchone()[0]
     cursor.execute("SELECT nickname FROM players WHERE user_id = ?", (loser_id,))
@@ -136,7 +141,7 @@ def get_all_users():
 def get_top_players():
     conn = sqlite3.connect("database.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT nickname, clan_tag, elo FROM players WHERE is_banned = 0 ORDER BY elo DESC LIMIT 10")
+    cursor.execute("SELECT nickname, clan_tag, elo, country FROM players WHERE is_banned = 0 ORDER BY elo DESC LIMIT 10")
     res = cursor.fetchall()
     conn.close()
     return res
@@ -146,6 +151,7 @@ class Registration(StatesGroup):
     waiting_for_nickname = State()
     waiting_for_game_id = State()
     waiting_for_clan_tag = State()
+    waiting_for_country = State()
     waiting_for_device = State()
     waiting_for_role = State()
 
@@ -160,6 +166,9 @@ class PracticeSearch(StatesGroup):
 class AdminBroadcast(StatesGroup):
     waiting_for_text = State()
 
+class ReportState(StatesGroup):
+    waiting_for_reason = State()
+
 # --- ИНИЦИАЛИЗА ---
 TOKEN = os.getenv("BOT_TOKEN")
 bot = Bot(token=TOKEN)
@@ -171,8 +180,8 @@ def generate_short_id():
 def main_keyboard(user_id):
     kb = [
         [KeyboardButton(text="⚔️ Найти Прак"), KeyboardButton(text="👤 Мой профиль")],
-        [KeyboardButton(text="⚙️ Редактировать профиль"), KeyboardButton(text="📜 История матчей")],
-        [KeyboardButton(text="🏆 Топ Игроков"), KeyboardButton(text="🛡 Регистрация Клана")]
+        [KeyboardButton(text="📝 Регистрация"), KeyboardButton(text="⚙️ Редактировать профиль")],
+        [KeyboardButton(text="📜 История матчей"), KeyboardButton(text="🏆 Топ Игроков")]
     ]
     if user_id == ADMIN_ID:
         kb.append([KeyboardButton(text="👑 Админ Панель")])
@@ -183,7 +192,7 @@ def main_keyboard(user_id):
 async def start_cmd(message: types.Message, state: FSMContext):
     await state.clear()
     p = get_player(message.from_user.id)
-    if p and p[9] == 1:
+    if p and p[10] == 1:
         await message.answer("❌ Вы заблокированы в системе за нарушение правил!")
         return
 
@@ -203,13 +212,13 @@ async def start_registration(message: types.Message, state: FSMContext):
         await message.answer("⚠️ **Вы уже зарегистрированы!** Для изменения данных используйте «⚙️ Редактировать профиль».", reply_markup=main_keyboard(message.from_user.id))
         return
 
-    await message.answer("📝 **Шаг 1/5:** Введите ваш **Игровой Никнейм**:", parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
+    await message.answer("📝 **Шаг 1/6:** Введите ваш **Игровой Никнейм**:", parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
     await state.set_state(Registration.waiting_for_nickname)
 
 @dp.message(Registration.waiting_for_nickname)
 async def process_nickname(message: types.Message, state: FSMContext):
     await state.update_data(nickname=message.text.strip())
-    await message.answer("🆔 **Шаг 2/5:** Введите ваш **Игровой ID** (цифрами):", parse_mode="Markdown")
+    await message.answer("🆔 **Шаг 2/6:** Введите ваш **Игровой ID** (цифрами):", parse_mode="Markdown")
     await state.set_state(Registration.waiting_for_game_id)
 
 @dp.message(Registration.waiting_for_game_id)
@@ -219,7 +228,7 @@ async def process_game_id(message: types.Message, state: FSMContext):
         return
     await state.update_data(game_id=message.text.strip())
     skip_kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="Пропустить")]], resize_keyboard=True)
-    await message.answer("🏷 **Шаг 3/5:** Введите ваш **Клан-тег** или нажмите **Пропустить**:", parse_mode="Markdown", reply_markup=skip_kb)
+    await message.answer("🏷 **Шаг 3/6:** Введите ваш **Клан-тег** или нажмите **Пропустить**:", parse_mode="Markdown", reply_markup=skip_kb)
     await state.set_state(Registration.waiting_for_clan_tag)
 
 @dp.message(Registration.waiting_for_clan_tag)
@@ -227,12 +236,26 @@ async def process_clan_tag(message: types.Message, state: FSMContext):
     clan_tag = "Нет" if message.text == "Пропустить" else message.text.strip()
     await state.update_data(clan_tag=clan_tag)
     
+    country_kb = ReplyKeyboardMarkup(keyboard=[
+        [KeyboardButton(text="🇰🇿 Казахстан"), KeyboardButton(text="🇷🇺 Россия")],
+        [KeyboardButton(text="🇺🇿 Узбекистан"), KeyboardButton(text="🇰🇬 Кыргызстан")],
+        [KeyboardButton(text="🇧🇾 Беларусь"), KeyboardButton(text="🇪🇺 Европа")]
+    ], resize_keyboard=True)
+    
+    await message.answer("🌍 **Шаг 4/6:** Выберите вашу **Страну / Регион**:", parse_mode="Markdown", reply_markup=country_kb)
+    await state.set_state(Registration.waiting_for_country)
+
+@dp.message(Registration.waiting_for_country)
+async def process_country(message: types.Message, state: FSMContext):
+    country = message.text.strip()
+    await state.update_data(country=country)
+
     dev_kb = ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text="📱 Phone (60 FPS)"), KeyboardButton(text="📱 Phone (90 FPS)")],
         [KeyboardButton(text="📱 Phone (120 FPS)"), KeyboardButton(text="📱 iPad (120 FPS)")]
     ], resize_keyboard=True)
     
-    await message.answer("📱 **Шаг 4/5:** Выберите ваше **Устройство / FPS**:", parse_mode="Markdown", reply_markup=dev_kb)
+    await message.answer("📱 **Шаг 5/6:** Выберите ваше **Устройство / FPS**:", parse_mode="Markdown", reply_markup=dev_kb)
     await state.set_state(Registration.waiting_for_device)
 
 @dp.message(Registration.waiting_for_device)
@@ -244,7 +267,7 @@ async def process_device(message: types.Message, state: FSMContext):
         [KeyboardButton(text="💥 Entry Fragger"), KeyboardButton(text="🔫 Rifler / Support")]
     ], resize_keyboard=True)
     
-    await message.answer("🎯 **Шаг 5/5:** Выберите вашу **Основную роль**:", parse_mode="Markdown", reply_markup=role_kb)
+    await message.answer("🎯 **Шаг 6/6:** Выберите вашу **Основную роль**:", parse_mode="Markdown", reply_markup=role_kb)
     await state.set_state(Registration.waiting_for_role)
 
 @dp.message(Registration.waiting_for_role)
@@ -252,7 +275,7 @@ async def process_role(message: types.Message, state: FSMContext):
     role = message.text.strip()
     data = await state.get_data()
     
-    add_player(message.from_user.id, data["nickname"], data["game_id"], data["clan_tag"], data["device"], role)
+    add_player(message.from_user.id, data["nickname"], data["game_id"], data["clan_tag"], data["device"], role, data["country"])
     await state.clear()
     await message.answer("🎉 **Регистрация успешно завершена!** Ваш стартовый Elo: 1000", parse_mode="Markdown", reply_markup=main_keyboard(message.from_user.id))
 
@@ -268,6 +291,7 @@ async def edit_profile_start(message: types.Message, state: FSMContext):
         [InlineKeyboardButton(text="Изменить Ник", callback_data="edit_nickname")],
         [InlineKeyboardButton(text="Изменить ID", callback_data="edit_game_id")],
         [InlineKeyboardButton(text="Изменить Клан", callback_data="edit_clan_tag")],
+        [InlineKeyboardButton(text="Изменить Страну", callback_data="edit_country")],
         [InlineKeyboardButton(text="Изменить Девайс", callback_data="edit_device")],
         [InlineKeyboardButton(text="Изменить Роль", callback_data="edit_role")]
     ])
@@ -278,7 +302,7 @@ async def process_edit_choice(call: types.CallbackQuery, state: FSMContext):
     field = call.data.replace("edit_", "")
     await state.update_data(edit_field=field)
     
-    names = {"nickname": "Новый Ник", "game_id": "Новый ID", "clan_tag": "Новый Клан-тег", "device": "Устройство / FPS", "role": "Новую Роль"}
+    names = {"nickname": "Новый Ник", "game_id": "Новый ID", "clan_tag": "Новый Клан-тег", "country": "Страну", "device": "Устройство / FPS", "role": "Новую Роль"}
     await call.message.answer(f"Введите **{names[field]}**:", parse_mode="Markdown")
     await state.set_state(EditProfile.waiting_for_value)
     await call.answer()
@@ -302,8 +326,17 @@ async def process_edit_value(message: types.Message, state: FSMContext):
 async def search_practice_start(message: types.Message, state: FSMContext):
     p = get_player(message.from_user.id)
     if not p:
-        await message.answer("⚠️ Зарегистрируйтесь перед поиском праков! Нажмите /start")
+        await message.answer("⚠️ Зарегистрируйтесь перед поиском праков!")
         return
+    if p[10] == 1:
+        await message.answer("❌ Вы заблокированы и не можете искать праки!")
+        return
+
+    # Защита от спама поиском: Проверяем, не стоит ли уже в очереди
+    for q_key, u_id in queues.items():
+        if u_id == message.from_user.id:
+            await message.answer("⚠️ Вы уже находитесь в очереди поиска! Дождитесь соперника.")
+            return
 
     kb = ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text="5x5"), KeyboardButton(text="2x2"), KeyboardButton(text="1x1")]
@@ -354,11 +387,11 @@ async def process_practice_time(message: types.Message, state: FSMContext):
         p1_data = get_player(opponent_id)
         p2_data = get_player(user_id)
 
-        msg_p1 = f"🎯 **Соперник найден!** ({mode} | {time_slot})\n\n👑 Капитан: **{p2_data[0]}** (`ID: {p2_data[1]}`)\n🏷 Клан: `{p2_data[2]}` | Elo: `{p2_data[3]}`\n📱 Device: {p2_data[4]}\n\nПодтвердите готовность:"
-        msg_p2 = f"🎯 **Соперник найден!** ({mode} | {time_slot})\n\n👑 Капитан: **{p1_data[0]}** (`ID: {p1_data[1]}`)\n🏷 Клан: `{p1_data[2]}` | Elo: `{p1_data[3]}`\n📱 Device: {p1_data[4]}\n\nПодтвердите готовность:"
+        msg_p1 = f"🎯 **Соперник найден!** ({mode} | {time_slot})\n\n👑 Капитан: **{p2_data[0]}** (`ID: {p2_data[1]}`)\n🏷 Клан: `{p2_data[2]}` | Elo: `{p2_data[3]}`\n🌍 Регион: {p2_data[6]}\n📱 Device: {p2_data[4]}\n\nПодтвердите готовность:"
+        msg_p2 = f"🎯 **Соперник найден!** ({mode} | {time_slot})\n\n👑 Капитан: **{p1_data[0]}** (`ID: {p1_data[1]}`)\n🏷 Клан: `{p1_data[2]}` | Elo: `{p1_data[3]}`\n🌍 Регион: {p1_data[6]}\n📱 Device: {p1_data[4]}\n\nПодтвердите готовность:"
 
-        await bot.send_message(opponent_id, msg_p1, parse_mode="Markdown", reply_markup=kb)
-        await message.answer(msg_p2, parse_mode="Markdown", reply_markup=main_keyboard(message.from_user.id))
+        await safe_send_message(bot, opponent_id, msg_p1, parse_mode="Markdown", reply_markup=kb)
+        await safe_send_message(bot, user_id, msg_p2, parse_mode="Markdown", reply_markup=kb)
     else:
         queues[queue_key] = user_id
         await message.answer(f"🔍 Вы встали в очередь поиска прака **{mode}** на **{time_slot}**.\nОжидайте соперника!", reply_markup=main_keyboard(message.from_user.id))
@@ -378,8 +411,8 @@ async def handle_ready(call: types.CallbackQuery):
     user_id = call.from_user.id
 
     if choice == "n":
-        await bot.send_message(m["p1"], "❌ Прак отменен одним из капитанов.")
-        await bot.send_message(m["p2"], "❌ Прак отменен одним из капитанов.")
+        await safe_send_message(bot, m["p1"], "❌ Прак отменен одним из капитанов.")
+        await safe_send_message(bot, m["p2"], "❌ Прак отменен одним из капитанов.")
         del matches[match_id]
         await call.answer()
         return
@@ -396,7 +429,6 @@ async def start_veto(match_id):
     p1_data = get_player(m["p1"])
     p2_data = get_player(m["p2"])
 
-    # Розыгрыш монетки (Coinflip) для хоста
     coin_winner_id = random.choice([m["p1"], m["p2"]])
     host_data = p1_data if coin_winner_id == m["p1"] else p2_data
     m["host_data"] = host_data
@@ -414,8 +446,8 @@ async def start_veto(match_id):
         f"👉 Первым банит: **{p1_data[0]}**"
     )
     
-    await bot.send_message(m["p1"], text, parse_mode="Markdown", reply_markup=kb)
-    await bot.send_message(m["p2"], text, parse_mode="Markdown", reply_markup=kb)
+    await safe_send_message(bot, m["p1"], text, parse_mode="Markdown", reply_markup=kb)
+    await safe_send_message(bot, m["p2"], text, parse_mode="Markdown", reply_markup=kb)
 
 @dp.callback_query(F.data.startswith("b_"))
 async def handle_ban(call: types.CallbackQuery):
@@ -441,17 +473,20 @@ async def handle_ban(call: types.CallbackQuery):
         m["final_map"] = final_map
         host_data = m["host_data"]
         
-        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🏁 Ввести результат матча", callback_data=f"fin_{match_id}")]])
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🏁 Ввести результат матча", callback_data=f"fin_{match_id}")],
+            [InlineKeyboardButton(text="⚠️ Пожаловаться / Репорт", callback_data=f"rep_{match_id}")]
+        ])
         
         text = (
             f"🔥 **КАРТА МАТЧА ОПРЕДЕЛЕНА!**\n\n"
             f"📍 Карта: **{final_map}**\n"
             f"⏱ Формат: **До 13 раундов (MR12)** | {m['mode']}\n\n"
             f"🏠 **Хост лобби:** **{host_data[0]}** (ID: `{host_data[1]}`)\n\n"
-            f"Удачи в игре! После завершения матча нажимите кнопку ниже:"
+            f"Удачи в игре! После завершения матча нажмите кнопку ниже:"
         )
-        await bot.send_message(m["p1"], text, parse_mode="Markdown", reply_markup=kb)
-        await bot.send_message(m["p2"], text, parse_mode="Markdown", reply_markup=kb)
+        await safe_send_message(bot, m["p1"], text, parse_mode="Markdown", reply_markup=kb)
+        await safe_send_message(bot, m["p2"], text, parse_mode="Markdown", reply_markup=kb)
     else:
         m["turn"] = m["p2"] if m["turn"] == m["p1"] else m["p1"]
         next_player = get_player(m["turn"])[0]
@@ -460,10 +495,38 @@ async def handle_ban(call: types.CallbackQuery):
         kb = InlineKeyboardMarkup(inline_keyboard=buttons)
 
         text = f"⚔️ Карта **{map_name}** забанена!\n\nОстались карты: {', '.join(m['maps'])}\n👉 Ход бана: **{next_player}**"
-        await bot.send_message(m["p1"], text, parse_mode="Markdown", reply_markup=kb)
-        await bot.send_message(m["p2"], text, parse_mode="Markdown", reply_markup=kb)
+        await safe_send_message(bot, m["p1"], text, parse_mode="Markdown", reply_markup=kb)
+        await safe_send_message(bot, m["p2"], text, parse_mode="Markdown", reply_markup=kb)
 
-# --- ЗАВЕРШЕНИЕ МАТЧА И ПРОВЕРКА ОШИБОК ---
+# --- СИСТЕМА РЕПОРТОВ И ЖАЛОБ ---
+@dp.callback_query(F.data.startswith("rep_"))
+async def handle_report_click(call: types.CallbackQuery, state: FSMContext):
+    match_id = call.data.split("_")[1]
+    await state.update_data(rep_match_id=match_id)
+    await call.message.answer("⚠️ Опишите причину жалобы (например: *Соперник не заходит в лобби*, *Использование софта*, *Ложный счет*):", parse_mode="Markdown")
+    await state.set_state(ReportState.waiting_for_reason)
+    await call.answer()
+
+@dp.message(ReportState.waiting_for_reason)
+async def process_report_reason(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    match_id = data.get("rep_match_id", "Неизвестно")
+    reason = message.text.strip()
+    user_p = get_player(message.from_user.id)
+    
+    await state.clear()
+    await message.answer("✅ Ваша жалоба отправлена администраторам на рассмотрение.")
+
+    if ADMIN_ID != 0:
+        rep_text = (
+            f"🚨 **НОВАЯ ЖАЛОБА / РЕПОРТ!**\n\n"
+            f"👤 Отправитель: **{user_p[0]}** (`ID: {message.from_user.id}`)\n"
+            f"📌 Match ID: `{match_id}`\n"
+            f"💬 Причина: {reason}"
+        )
+        await safe_send_message(bot, ADMIN_ID, rep_text, parse_mode="Markdown")
+
+# --- ЗАВЕРШЕНИЕ МАТЧА ---
 @dp.callback_query(F.data.startswith("fin_"))
 async def handle_finish(call: types.CallbackQuery):
     match_id = call.data.split("_")[1]
@@ -491,12 +554,10 @@ async def process_match_claim(call: types.CallbackQuery):
 
     await call.answer("Ваш ответ принят!")
 
-    # Проверка, ответили ли оба
     if len(m["claims"]) == 2:
         c1 = m["claims"][m["p1"]]
         c2 = m["claims"][m["p2"]]
 
-        # Совпадение: один заявляет WIN, другой LOSS
         if (c1 == "win" and c2 == "loss") or (c1 == "loss" and c2 == "win"):
             winner_id = m["p1"] if c1 == "win" else m["p2"]
             loser_id = m["p2"] if c1 == "win" else m["p1"]
@@ -512,37 +573,35 @@ async def process_match_claim(call: types.CallbackQuery):
                 f"💀 Поражение: **{l_p[0]}** (-25 Elo) 📉\n\n"
                 f"Рейтинг игроков и история обновлены!"
             )
-            await bot.send_message(m["p1"], res_text, parse_mode="Markdown")
-            await bot.send_message(m["p2"], res_text, parse_mode="Markdown")
+            await safe_send_message(bot, m["p1"], res_text, parse_mode="Markdown")
+            await safe_send_message(bot, m["p2"], res_text, parse_mode="Markdown")
             del matches[match_id]
         else:
-            # Расхождение в данных
-            err_text = "⚠️ **Внимание:** Введенные результаты не совпадают!\nМатч отправлен на проверку администратору. Приготовьте скриншот счета."
-            await bot.send_message(m["p1"], err_text, parse_mode="Markdown")
-            await bot.send_message(m["p2"], err_text, parse_mode="Markdown")
+            err_text = "⚠️ **Внимание:** Введенные результаты не совпадают!\nМатч отправлен на проверку администратору."
+            await safe_send_message(bot, m["p1"], err_text, parse_mode="Markdown")
+            await safe_send_message(bot, m["p2"], err_text, parse_mode="Markdown")
             if ADMIN_ID != 0:
-                await bot.send_message(ADMIN_ID, f"🚨 **Спорный матч!**\nMatch ID: `{match_id}`\nИгрок 1: `{m['p1']}`\nИгрок 2: `{m['p2']}`")
+                await safe_send_message(bot, ADMIN_ID, f"🚨 **Спорный матч!**\nMatch ID: `{match_id}`\nИгрок 1: `{m['p1']}`\nИгрок 2: `{m['p2']}`", parse_mode="Markdown")
 
 # --- ПРОФИЛЬ И ИСТОРИЯ ---
 @dp.message(F.text == "👤 Мой профиль")
 async def show_profile(message: types.Message):
     p = get_player(message.from_user.id)
     if p:
-        total = p[6] + p[7]
-        wr = round((p[6] / total * 100), 1) if total > 0 else 0
+        total = p[7] + p[8]
+        wr = round((p[7] / total * 100), 1) if total > 0 else 0
         text = (
             f"👤 **ПРОФИЛЬ ИГРОКА**\n\n"
             f"Ник: `{p[0]}` | ID: `{p[1]}`\n"
-            f"🏷 Клан: `{p[2]}`\n"
-            f"📱 Device: `{p[4]}`\n"
-            f"🎯 Роль: `{p[5]}`\n\n"
+            f"🏷 Клан: `{p[2]}` | 🌍 Регион: `{p[6]}`\n"
+            f"📱 Device: `{p[4]}` | 🎯 Роль: `{p[5]}`\n\n"
             f"⚡️ **Elo рейтинг:** `{p[3]}`\n"
-            f"📊 **Статистика:** Побед: `{p[6]}` | Поражений: `{p[7]}`\n"
-            f"🔥 **Винрейт:** `{wr}%` | **Стрик:** `{p[8]}`"
+            f"📊 **Статистика:** Побед: `{p[7]}` | Поражений: `{p[8]}`\n"
+            f"🔥 **Винрейт:** `{wr}%` | **Стрик:** `{p[9]}`"
         )
         await message.answer(text, parse_mode="Markdown")
     else:
-        await message.answer("⚠️ Вы еще не зарегистрированы! Нажмите /start")
+        await message.answer("⚠️ Вы еще не зарегистрированы! Нажмите кнопку «📝 Регистрация»")
 
 @dp.message(F.text == "📜 История матчей")
 async def show_history(message: types.Message):
@@ -561,8 +620,8 @@ async def show_history(message: types.Message):
 async def show_top_players(message: types.Message):
     top = get_top_players()
     text = "🏆 **ТОП-10 ИГРОКОВ PO ELO:**\n\n"
-    for i, (nick, clan, elo) in enumerate(top, 1):
-        text += f"**{i}. {nick}** `[{clan}]` — `{elo} Elo`\n"
+    for i, (nick, clan, elo, country) in enumerate(top, 1):
+        text += f"**{i}. {nick}** `[{clan}]` {country} — `{elo} Elo`\n"
     await message.answer(text, parse_mode="Markdown")
 
 # --- АДМИН ПАНЕЛЬ ---
@@ -592,7 +651,7 @@ async def cmd_give_elo(message: types.Message):
         conn.commit()
         conn.close()
         await message.answer(f"✅ Игроку `{target_id}` изменено Elo на `{delta}`", parse_mode="Markdown")
-    except Exception as e:
+    except Exception:
         await message.answer("⚠️ Ошибка. Пример использования: `/give_elo 123456789 50`")
 
 @dp.message(Command("ban_player"))
@@ -603,8 +662,19 @@ async def cmd_ban_player(message: types.Message):
         target_id = int(message.text.split()[1])
         update_player_field(target_id, "is_banned", 1)
         await message.answer(f"🚫 Игрок `{target_id}` заблокирован.")
-    except:
+    except Exception:
         await message.answer("Пример: `/ban_player 123456789`")
+
+@dp.message(Command("unban_player"))
+async def cmd_unban_player(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    try:
+        target_id = int(message.text.split()[1])
+        update_player_field(target_id, "is_banned", 0)
+        await message.answer(f"✅ Игрок `{target_id}` разблокирован.")
+    except Exception:
+        await message.answer("Пример: `/unban_player 123456789`")
 
 @dp.message(Command("broadcast"))
 async def cmd_broadcast(message: types.Message, state: FSMContext):
@@ -619,12 +689,10 @@ async def process_broadcast(message: types.Message, state: FSMContext):
     users = get_all_users()
     count = 0
     for uid in users:
-        try:
-            await bot.send_message(uid, f"📢 **ОПОВЕЩЕНИЕ ОТ АДМИНИСТРАЦИИ:**\n\n{text}", parse_mode="Markdown")
+        res = await safe_send_message(bot, uid, f"📢 **ОПОВЕЩЕНИЕ ОТ АДМИНИСТРАЦИИ:**\n\n{text}", parse_mode="Markdown")
+        if res:
             count += 1
-            await asyncio.sleep(0.05)
-        except:
-            pass
+        await asyncio.sleep(0.05)
     await state.clear()
     await message.answer(f"✅ Рассылка завершена! Получили сообщений: {count}")
 
@@ -646,3 +714,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
