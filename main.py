@@ -752,7 +752,6 @@ async def process_practice_time(message: types.Message, state: FSMContext):
     clan = get_clan_by_leader(message.from_user.id)
     clan_id = clan[0]
 
-    # Ищем, нет ли уже созданной заявки на это же время и дату от другого клана
     matched_time_key = None
     for tm_id, tm_data in time_matches.items():
         if tm_data["date"] == date_str and tm_data["time"] == time_str and tm_data["c2_id"] is None:
@@ -761,7 +760,6 @@ async def process_practice_time(message: types.Message, state: FSMContext):
                 break
 
     if matched_time_key:
-        # Соперник найден! Связываем их
         tm = time_matches[matched_time_key]
         tm["c2_id"] = clan_id
         tm["c2_leader"] = message.from_user.id
@@ -788,7 +786,6 @@ async def process_practice_time(message: types.Message, state: FSMContext):
             pass
         await message.answer(f"✅ Соперник найден на `{date_str} в {time_str}`! Обоим капитанам отправлен запрос на подтверждение.", parse_mode="Markdown", reply_markup=main_keyboard(message.from_user.id))
     else:
-        # Создаем новую заявку, клан при этом свободен искать другие праки
         tm_id = generate_short_id()
         time_matches[tm_id] = {
             "date": date_str,
@@ -837,7 +834,6 @@ async def time_pracc_ready(call: types.CallbackQuery):
     await call.answer("Статус «Готов» принят!")
 
     if tm["c1_confirmed"] and tm["c2_confirmed"]:
-        # Оба подтвердили участие! Создаем запись ожидания назначенного времени
         c1 = get_clan(tm["c1_id"])
         c2 = get_clan(tm["c2_id"])
         
@@ -873,23 +869,32 @@ async def time_pracc_decline(call: types.CallbackQuery):
 # --- ФОНОВЫЙ ПЛАНИРОВЩИК ВРЕМЕНИ И СТАРТА МАТЧЕЙ ---
 async def pracc_scheduler():
     while True:
-        now_time = datetime.now().strftime("%H:%M")
-        # Проверяем слоты по времени
+        now = datetime.now()
+        current_time_minutes = now.hour * 60 + now.minute
+
         for tm_id, tm in list(time_matches.items()):
-            if tm.get("c1_confirmed") and tm.get("c2_confirmed") and tm["time"] == now_time:
-                # Настало время матча! Отправляем кнопку «Начать матч»
-                c1 = get_clan(tm["c1_id"])
-                c2 = get_clan(tm["c2_id"])
-                
-                kb = InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="⚔️ Начать матч", callback_data=f"start_timed_match_{tm_id}")]
-                ])
+            if tm.get("c1_confirmed") and tm.get("c2_confirmed") and not tm.get("started", False):
                 try:
-                    await bot.send_message(c1[3], f"⏰ Время прака `{tm['time']}` настало! Нажмите кнопку для старта:", reply_markup=kb, parse_mode="Markdown")
-                    await bot.send_message(c2[3], f"⏰ Время прака `{tm['time']}` настало! Нажмите кнопку для старта:", reply_markup=kb, parse_mode="Markdown")
+                    parts = tm["time"].split(":")
+                    pracc_minutes = int(parts[0]) * 60 + int(parts[1])
+                    
+                    if current_time_minutes >= pracc_minutes:
+                        tm["started"] = True
+                        
+                        c1 = get_clan(tm["c1_id"])
+                        c2 = get_clan(tm["c2_id"])
+                        
+                        kb = InlineKeyboardMarkup(inline_keyboard=[
+                            [InlineKeyboardButton(text="⚔️ Начать матч", callback_data=f"start_timed_match_{tm_id}")]
+                        ])
+                        try:
+                            await bot.send_message(c1[3], f"⏰ Время прака (`{tm['time']}`) наступило! Нажмите кнопку для старта матча:", reply_markup=kb, parse_mode="Markdown")
+                            await bot.send_message(c2[3], f"⏰ Время прака (`{tm['time']}`) наступило! Нажмите кнопку для старта матча:", reply_markup=kb, parse_mode="Markdown")
+                        except Exception:
+                            pass
                 except Exception:
                     pass
-        await asyncio.sleep(30)
+        await asyncio.sleep(10)
 
 @dp.callback_query(F.data.startswith("start_timed_match_"))
 async def start_timed_match_cb(call: types.CallbackQuery):
@@ -899,9 +904,7 @@ async def start_timed_match_cb(call: types.CallbackQuery):
         await call.answer("Матч не найден или уже запущен.", show_alert=True)
         return
 
-    # Запускаем логику матча
     await start_match_logic(tm["c1_id"], tm["c2_id"], f"Прак на {tm['time']}")
-    # Удаляем из списка ожидания
     time_matches.pop(tm_id, None)
     await call.answer()
 
@@ -1269,5 +1272,6 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
 
