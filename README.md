@@ -1,1 +1,2 @@
-# So2-bot
+aiogram>=3.0.0
+aiohttp
