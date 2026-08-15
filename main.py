@@ -1,10 +1,12 @@
 import asyncio
+io_bytes_io = None
 import io
 import logging
 import os
 import random
 import sqlite3
 import string
+from datetime import datetime
 from aiohttp import web
 from PIL import Image, ImageDraw, ImageFont
 import google.generativeai as genai
@@ -28,7 +30,7 @@ if GEMINI_KEY:
 
 MAPS_LIST = ["Sandstone", "Province", "Rust", "Dune", "Hanami", "Prison", "Breeze"]
 
-queues = {}     # { "5x5_19:00": clan_id }
+queues = {"fast": []}     # {"fast": [clan_id], "time_20:00": [clan_id]}
 matches = {}    # { match_id: data }
 
 def init_db():
@@ -178,7 +180,6 @@ class CreateClanState(StatesGroup):
     waiting_for_name = State()
 
 class PracticeSearch(StatesGroup):
-    waiting_for_mode = State()
     waiting_for_time = State()
 
 class ClanJoinState(StatesGroup):
@@ -218,7 +219,7 @@ async def start_cmd(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer(
         "⚡️ **STANDOFF 2 | КЛАНОВАЯ АРЕНА PRO** ⚡️\n\n"
-        "Добро пожаловать на профессиональную арену праков! Здесь тебя ждут Veto-баны карт, автоматическая аналитика матчей с помощью ИИ, система ростеров и таблица лидеров Elo.",
+        "Добро пожаловать на профессиональную арену праков! Выбирай фаст-прак для игры прямо сейчас или ставь бронь по времени.",
         parse_mode="Markdown", reply_markup=main_keyboard(message.from_user.id)
     )
 
@@ -680,29 +681,47 @@ async def leave_clan_cb(call: types.CallbackQuery):
     await call.message.edit_text("🚪 Вы успешно покинули клан.")
     await call.answer()
 
-# --- ПОИСК ПРАКА И VETO (С ХОСТОМ И ID) ---
+# --- ПОИСК ПРАКА (ФАСТ И ПО ВРЕМЕНИ) И VETO ---
 @dp.message(F.text == "⚔️ Найти Прак (Кланы)")
-async def search_clan_practice(message: types.Message, state: FSMContext):
+async def search_clan_practice(message: types.Message):
     clan = get_clan_by_leader(message.from_user.id)
     if not clan:
         await message.answer("⚠️ Искать прак от имени клана может только Капитан!")
         return
 
-    kb = ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text="5x5"), KeyboardButton(text="2x2")],
-        [KeyboardButton(text="❌ Отмена")]
-    ], resize_keyboard=True)
-    await message.answer("🎮 Выберите **формат прака**:", reply_markup=kb)
-    await state.set_state(PracticeSearch.waiting_for_mode)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⚡ Фаст-прак (Прямо сейчас)", callback_data="search_fast")],
+        [InlineKeyboardButton(text="⏰ Прак по времени", callback_data="search_time")]
+    ])
+    await message.answer("🎮 Выберите режим поиска прака:", reply_markup=kb)
 
-@dp.message(PracticeSearch.waiting_for_mode)
-async def process_clan_mode(message: types.Message, state: FSMContext):
-    if message.text == "❌ Отмена":
-        await cancel_handler(message, state)
+@dp.callback_query(F.data == "search_fast")
+async def fast_pracc_handler(call: types.CallbackQuery):
+    clan = get_clan_by_leader(call.from_user.id)
+    if not clan:
+        await call.answer("⚠️ Вы не капитан клана!", show_alert=True)
         return
-    await state.update_data(mode=message.text.strip())
-    await message.answer("⏳ Укажите **время прака** (например: `19:00` или `Прямо сейчас`):", parse_mode="Markdown", reply_markup=cancel_keyboard())
+    
+    clan_id = clan[0]
+    if queues["fast"] and queues["fast"][0] != clan_id:
+        opponent_id = queues["fast"].pop(0)
+        await call.answer("Соперник найден!")
+        await start_match_logic(opponent_id, clan_id, "Фаст-прак")
+    elif queues["fast"] and queues["fast"][0] == clan_id:
+        await call.answer("Вы уже в очереди!", show_alert=True)
+    else:
+        queues["fast"].append(clan_id)
+        await call.message.edit_text(f"⚡ Клан **[{clan[1]}]** добавлен в очередь **Фаст-прак**. Ожидаем соперника...", parse_mode="Markdown")
+
+@dp.callback_query(F.data == "search_time")
+async def time_pracc_menu(call: types.CallbackQuery, state: FSMContext):
+    clan = get_clan_by_leader(call.from_user.id)
+    if not clan:
+        await call.answer("⚠️ Вы не капитан клана!", show_alert=True)
+        return
+    await call.message.answer("⏳ Укажите время прака в формате `ЧЧ:ММ` (например: `20:00`):", parse_mode="Markdown", reply_markup=cancel_keyboard())
     await state.set_state(PracticeSearch.waiting_for_time)
+    await call.answer()
 
 @dp.message(PracticeSearch.waiting_for_time)
 async def process_clan_time(message: types.Message, state: FSMContext):
@@ -710,64 +729,78 @@ async def process_clan_time(message: types.Message, state: FSMContext):
         await cancel_handler(message, state)
         return
     time_slot = message.text.strip()
-    data = await state.get_data()
-    mode = data["mode"]
-    
     clan = get_clan_by_leader(message.from_user.id)
     clan_id = clan[0]
     await state.clear()
 
-    q_key = f"{mode}_{time_slot}"
+    q_key = f"time_{time_slot}"
+    if q_key not in queues:
+        queues[q_key] = []
 
-    if q_key in queues and queues[q_key] != clan_id:
-        opp_clan_id = queues.pop(q_key)
-        
-        if is_blocked(clan_id, opp_clan_id) or is_blocked(opp_clan_id, clan_id):
-            await message.answer("⚠️ Найден противник из черного списка. Поиск продолжен...")
-            queues[q_key] = clan_id
-            return
+    if clan_id in queues[q_key]:
+        await message.answer(f"⚠️ Ваш клан уже зарегистрирован на время `{time_slot}`!", parse_mode="Markdown", reply_markup=main_keyboard(message.from_user.id))
+        return
 
-        match_id = generate_short_id()
-        c1 = get_clan(opp_clan_id)
-        c2 = get_clan(clan_id)
+    queues[q_key].append(clan_id)
+    await message.answer(f"⏰ Клан **[{clan[1]}]** зарегистрирован на прак в **{time_slot}**. Ожидаем соперника на это время...", parse_mode="Markdown", reply_markup=main_keyboard(message.from_user.id))
 
-        # Получаем ID капитанов для вывода
-        p1_data = get_player(c1[3])
-        p2_data = get_player(c2[3])
-        p1_game_id = p1_data[1] if p1_data else "Не указан"
-        p2_game_id = p2_data[1] if p2_data else "Не указан"
+# --- ФОНОВЫЙ ПЛАНИРОВЩИК ВРЕМЕНИ ---
+async def pracc_scheduler():
+    while True:
+        now = datetime.now().strftime("%H:%M")
+        for key in list(queues.keys()):
+            if key.startswith("time_") and key == f"time_{now}":
+                clan_ids = queues.pop(key)
+                if len(clan_ids) >= 2:
+                    await start_match_logic(clan_ids[0], clan_ids[1], now)
+        await asyncio.sleep(60)
 
-        # Рандомное определение хоста лобби
-        host_clan = random.choice([c1, c2])
+async def start_match_logic(c1_id, c2_id, mode):
+    c1 = get_clan(c1_id)
+    c2 = get_clan(c2_id)
+    
+    if is_blocked(c1_id, c2_id) or is_blocked(c2_id, c1_id):
+        return
 
-        matches[match_id] = {
-            "c1_id": c1[0], "c2_id": c2[0],
-            "c1_tag": c1[1], "c2_tag": c2[1],
-            "p1_leader": c1[3], "p2_leader": c2[3],
-            "mode": mode, "maps": MAPS_LIST.copy(), "turn": c1[3],
-            "host_tag": host_clan[1]
-        }
+    match_id = generate_short_id()
+    
+    p1_data = get_player(c1[3])
+    p2_data = get_player(c2[3])
+    p1_game_id = p1_data[1] if p1_data else "Не указан"
+    p2_game_id = p2_data[1] if p2_data else "Не указан"
 
-        poster_bio = create_vs_poster(c1[8], c2[8], c1[1], c2[1])
+    host_clan = random.choice([c1, c2])
 
-        caption = (
-            f"🔥 **КЛАНОВЫЙ ПРАК НАЙДЕН! [{mode}]** 🔥\n\n"
-            f"🛡 **{c1[2]}** `[{c1[1]}]` (Elo: {c1[4]})\n"
-            f"👤 Капитан: `{c1[2]}` | ID: `🔒 {p1_game_id}`\n"
-            f"⚔️ **VS** ⚔️\n"
-            f"🛡 **{c2[2]}** `[{c2[1]}]` (Elo: {c2[4]})\n"
-            f"👤 Капитан: `{c2[2]}` | ID: `🔒 {p2_game_id}`\n\n"
-            f"🏰 **Хост лобби (создает комнату):** `[{host_clan[1]}] {host_clan[2]}`\n\n"
-            f"🎯 Начинаем фазу банов карт (Veto)!"
-        )
+    matches[match_id] = {
+        "c1_id": c1[0], "c2_id": c2[0],
+        "c1_tag": c1[1], "c2_tag": c2[1],
+        "p1_leader": c1[3], "p2_leader": c2[3],
+        "mode": mode, "maps": MAPS_LIST.copy(), "turn": c1[3],
+        "host_tag": host_clan[1],
+        "host_name": host_clan[2],
+        "host_game_id": p2_data[1] if host_clan[0] == c2[0] else p1_game_id
+    }
 
+    poster_bio = create_vs_poster(c1[8], c2[8], c1[1], c2[1])
+
+    caption = (
+        f"🔥 **КЛАНОВЫЙ ПРАК НАЙДЕН! [{mode}]** 🔥\n\n"
+        f"🛡 **{c1[2]}** `[{c1[1]}]` (Elo: {c1[4]})\n"
+        f"👤 Капитан: `{c1[2]}` | ID: `🔒 {p1_game_id}`\n"
+        f"⚔️ **VS** ⚔️\n"
+        f"🛡 **{c2[2]}** `[{c2[1]}]` (Elo: {c2[4]})\n"
+        f"👤 Капитан: `{c2[2]}` | ID: `🔒 {p2_game_id}`\n\n"
+        f"🏰 **Хост лобби (создает комнату):** `[{host_clan[1]}] {host_clan[2]}`\n\n"
+        f"🎯 Начинаем фазу банов карт (Veto)!"
+    )
+
+    try:
         await bot.send_photo(c1[3], photo=types.BufferedInputFile(poster_bio.getvalue(), filename="vs.png"), caption=caption, parse_mode="Markdown")
         await bot.send_photo(c2[3], photo=types.BufferedInputFile(poster_bio.getvalue(), filename="vs.png"), caption=caption, parse_mode="Markdown")
-        
-        await send_veto_turn(match_id)
-    else:
-        queues[q_key] = clan_id
-        await message.answer(f"🔍 Клан **[{clan[1]}]** добавлен в очередь **{mode}** ({time_slot}). Ожидаем соперника...", reply_markup=main_keyboard(message.from_user.id))
+    except Exception:
+        pass
+    
+    await send_veto_turn(match_id)
 
 # --- ФАЗА VETO ---
 async def send_veto_turn(match_id):
@@ -785,15 +818,19 @@ async def send_veto_turn(match_id):
         res_text = (
             f"🏁 **VETO ЗАВЕРШЕНО!**\n\n"
             f"🗺 Игровая карта: **{final_map}**\n"
-            f"🏰 Создает лобби: **[{m['host_tag']}]**\n\n"
+            f"🏰 Создает лобби (Хостер): **[{m['host_tag']}] {m['host_name']}**\n"
+            f"🆔 **Игровой ID хостера:** `{m['host_game_id']}`\n\n"
             f"Заходите в лобби Standoff 2. После игры нажмите кнопку ниже и пришлите скриншот результатов!"
         )
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="📸 Отправить скриншот матча", callback_data=f"upscreen_{match_id}")],
             [InlineKeyboardButton(text="⚠️ Пожаловаться", callback_data=f"rep_{match_id}")]
         ])
-        await bot.send_message(m["p1_leader"], res_text, reply_markup=kb, parse_mode="Markdown")
-        await bot.send_message(m["p2_leader"], res_text, reply_markup=kb, parse_mode="Markdown")
+        try:
+            await bot.send_message(m["p1_leader"], res_text, reply_markup=kb, parse_mode="Markdown")
+            await bot.send_message(m["p2_leader"], res_text, reply_markup=kb, parse_mode="Markdown")
+        except Exception:
+            pass
         return
 
     kb_list = []
@@ -802,8 +839,11 @@ async def send_veto_turn(match_id):
     
     kb = InlineKeyboardMarkup(inline_keyboard=kb_list)
 
-    await bot.send_message(turn_user, f"🎯 **Ваша очередь банить карту!**\nОстались: `{', '.join(m['maps'])}`", reply_markup=kb, parse_mode="Markdown")
-    await bot.send_message(other_user, f"⏳ Соперник выбирает карту для бана...\nОстались: `{', '.join(m['maps'])}`", parse_mode="Markdown")
+    try:
+        await bot.send_message(turn_user, f"🎯 **Ваша очередь банить карту!**\nОстались: `{', '.join(m['maps'])}`", reply_markup=kb, parse_mode="Markdown")
+        await bot.send_message(other_user, f"⏳ Соперник выбирает карту для бана...\nОстались: `{', '.join(m['maps'])}`", parse_mode="Markdown")
+    except Exception:
+        pass
 
 @dp.callback_query(F.data.startswith("ban_"))
 async def handle_map_ban(call: types.CallbackQuery):
@@ -872,13 +912,14 @@ async def handle_screenshot_ai(message: types.Message, state: FSMContext):
 
     photo = message.photo[-1]
     file_info = await bot.get_file(photo.file_id)
-    photo_bytes = await bot.download_file(file_info.file_path)
+    photo_file = await bot.download_file(file_info.file_path)
+    photo_bytes = photo_file.read() if hasattr(photo_file, "read") else photo_file
 
     try:
         model = genai.GenerativeModel('gemini-1.5-flash')
         prompt = "Проанализируй скриншот результатов Standoff 2. Назови победителя, счет матча, лучшие киллы и MVP."
         
-        image_part = {"mime_type": "image/jpeg", "data": photo_bytes.read()}
+        image_part = {"mime_type": "image/jpeg", "data": photo_bytes}
         response = model.generate_content([prompt, image_part])
         
         await message.answer(f"📊 **ОТЧЕТ ИИ-АРБИТРА ПО МАТЧУ:**\n\n{response.text}", parse_mode="Markdown")
@@ -893,6 +934,7 @@ async def handle(request):
 async def main():
     logging.basicConfig(level=logging.INFO)
     init_db()
+    
     app = web.Application()
     app.router.add_get("/", handle)
     runner = web.AppRunner(app)
@@ -900,7 +942,10 @@ async def main():
     port = int(os.environ.get("PORT", 8080))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
+    
+    asyncio.create_task(pracc_scheduler())
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    asyncio.run(main()) 
+    asyncio.run(main())
+
