@@ -68,6 +68,14 @@ def init_db():
     """)
 
     cursor.execute("""
+        CREATE TABLE IF NOT EXISTS clan_applications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            clan_id INTEGER,
+            user_id INTEGER
+        )
+    """)
+
+    cursor.execute("""
         CREATE TABLE IF NOT EXISTS clan_blacklist (
             clan_id INTEGER,
             blocked_clan_id INTEGER,
@@ -134,10 +142,12 @@ def create_vs_poster(clan1_avatar, clan2_avatar, tag1, tag2):
     
     def load_avatar(path):
         if path and os.path.exists(path):
-            img = Image.open(path).convert('RGB')
-        else:
-            img = Image.new('RGB', (200, 200), color=(40, 40, 50))
-        return img.resize((200, 200))
+            try:
+                img = Image.open(path).convert('RGB')
+                return img.resize((200, 200))
+            except Exception:
+                pass
+        return Image.new('RGB', (200, 200), color=(40, 40, 50))
 
     av1 = load_avatar(clan1_avatar)
     av2 = load_avatar(clan2_avatar)
@@ -170,6 +180,12 @@ class CreateClanState(StatesGroup):
 class PracticeSearch(StatesGroup):
     waiting_for_mode = State()
     waiting_for_time = State()
+
+class ClanJoinState(StatesGroup):
+    waiting_for_tag = State()
+
+class AvatarState(StatesGroup):
+    waiting_for_photo = State()
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
@@ -328,22 +344,25 @@ async def show_profile(message: types.Message):
     )
     await message.answer(text, parse_mode="Markdown")
 
-# --- УПРАВЛЕНИЕ КЛАНОМ ---
+# --- МЕХАНИКА КЛАНОВ ---
 @dp.message(F.text == "🛡 Мой Клан")
 async def show_my_clan(message: types.Message):
     p = get_player(message.from_user.id)
     if not p or p[2] == 0:
-        await message.answer("⚠️ Вы не состоите ни в одном клане. Создайте свой через меню «⚙️ Управление Кланом».")
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔍 Найти клан / Вступить", callback_data="find_clan_menu")]
+        ])
+        await message.answer("⚠️ Вы не состоите ни в одном клане. Вы можете создать свой или подать заявку в существующий.", reply_markup=kb)
         return
     
     c = get_clan(p[2])
     conn = sqlite3.connect("database.db")
     cur = conn.cursor()
-    cur.execute("SELECT nickname, role FROM players WHERE clan_id = ?", (c[0],))
+    cur.execute("SELECT user_id, nickname, game_id, role FROM players WHERE clan_id = ?", (c[0],))
     members = cur.fetchall()
     conn.close()
 
-    members_str = "\n".join([f"• `{m[0]}` — _{m[1]}_" for m in members])
+    members_str = "\n".join([f"• `{m[1]}` (ID: `{m[2]}`) — _{m[3]}_" for m in members])
 
     text = (
         f"🛡 **ИНФОРМАЦИЯ О КЛАНЕ**\n\n"
@@ -351,32 +370,42 @@ async def show_my_clan(message: types.Message):
         f"📊 Elo Рейтинг: `{c[4]}`\n"
         f"🔥 Винстрик: `{c[7]}` матчей подряд\n"
         f"🏆 Побед: `{c[5]}` | ❌ Поражений: `{c[6]}`\n\n"
-        f"👥 **Состав клана ({len(members)} игроков):**\n{members_str}"
+        f"👥 **Состав ростера ({len(members)} игроков):**\n{members_str}"
     )
     await message.answer(text, parse_mode="Markdown")
 
 @dp.message(F.text == "⚙️ Управление Кланом")
 async def clan_management(message: types.Message, state: FSMContext):
+    p = get_player(message.from_user.id)
+    if not p:
+        await message.answer("⚠️ Сначала зарегистрируйтесь!")
+        return
+
     clan = get_clan_by_leader(message.from_user.id)
     if not clan:
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🛠 Создать новый клан", callback_data="create_clan_start")]
-        ])
-        await message.answer("⚙️ Вы не являетесь лидером клана.", reply_markup=kb)
+        if p[2] != 0:
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🚪 Покинуть клан", callback_data="leave_clan")]
+            ])
+            await message.answer("⚙️ Вы участник клана. Вы можете покинуть его:", reply_markup=kb)
+        else:
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🛠 Создать новый клан", callback_data="create_clan_start")],
+                [InlineKeyboardButton(text="🔍 Вступить в клан", callback_data="find_clan_menu")]
+            ])
+            await message.answer("⚙️ Вы не состоите в клане.", reply_markup=kb)
     else:
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="👥 Участники ростера", callback_data="clan_roster")],
+            [InlineKeyboardButton(text="📩 Заявки в клан", callback_data="clan_applications")],
             [InlineKeyboardButton(text="🖼 Изменить аватарку", callback_data="clan_avatar")],
             [InlineKeyboardButton(text="❌ Распустить клан", callback_data="clan_disband")]
         ])
-        await message.answer(f"⚙️ **Панель управления кланом [{clan[1]}]**", reply_markup=kb, parse_mode="Markdown")
+        await message.answer(f"⚙️ **Панель лидера клана [{clan[1]}]**", reply_markup=kb, parse_mode="Markdown")
 
 @dp.callback_query(F.data == "create_clan_start")
 async def create_clan_callback(call: types.CallbackQuery, state: FSMContext):
     p = get_player(call.from_user.id)
-    if not p:
-        await call.answer("⚠️ Сначала зарегистрируйтесь как игрок!", show_alert=True)
-        return
     if p[2] != 0:
         await call.answer("⚠️ Вы уже состоите в клане!", show_alert=True)
         return
@@ -422,7 +451,236 @@ async def process_clan_name(message: types.Message, state: FSMContext):
         await message.answer("⚠️ Клан с таким тегом уже существует! Введите другой тег.")
         await state.set_state(CreateClanState.waiting_for_tag)
 
-# --- ПОИСК ПРАКА И VETO ---
+# --- ПОИСК И ВСТУПЛЕНИЕ В КЛАН ---
+@dp.callback_query(F.data == "find_clan_menu")
+async def find_clan_menu_cb(call: types.CallbackQuery, state: FSMContext):
+    await call.message.answer("🔍 Введите **тег клана**, в который хотите вступить:", parse_mode="Markdown", reply_markup=cancel_keyboard())
+    await state.set_state(ClanJoinState.waiting_for_tag)
+    await call.answer()
+
+@dp.message(ClanJoinState.waiting_for_tag)
+async def process_join_clan(message: types.Message, state: FSMContext):
+    if message.text == "❌ Отмена":
+        await cancel_handler(message, state)
+        return
+    tag = message.text.strip().upper()
+    
+    conn = sqlite3.connect("database.db")
+    cur = conn.cursor()
+    cur.execute("SELECT clan_id, clan_name, leader_id FROM clans WHERE clan_tag = ?", (tag,))
+    clan = cur.fetchone()
+    
+    if not clan:
+        conn.close()
+        await message.answer("⚠️ Клан с таким тегом не найден. Попробуйте еще раз:")
+        return
+
+    clan_id, clan_name, leader_id = clan
+    
+    cur.execute("SELECT 1 FROM clan_applications WHERE clan_id = ? AND user_id = ?", (clan_id, message.from_user.id))
+    if cur.fetchone():
+        conn.close()
+        await state.clear()
+        await message.answer("⚠️ Вы уже подали заявку в этот клан. Ожидайте ответа капитана.", reply_markup=main_keyboard(message.from_user.id))
+        return
+
+    cur.execute("INSERT INTO clan_applications (clan_id, user_id) VALUES (?, ?)", (clan_id, message.from_user.id))
+    conn.commit()
+    conn.close()
+
+    await state.clear()
+    await message.answer(f"✅ Заявка на вступление в клан **{clan_name}** `[{tag}]` успешно отправлена капитану!", parse_mode="Markdown", reply_markup=main_keyboard(message.from_user.id))
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📩 Посмотреть заявки", callback_data="clan_applications")]
+    ])
+    try:
+        await bot.send_message(leader_id, f"🔔 Новый игрок (`{message.from_user.full_name}`) хочет вступить в ваш клан!", reply_markup=kb)
+    except Exception:
+        pass
+
+# --- РАБОТА С РОСТЕРОМ И КНОПКАМИ ---
+@dp.callback_query(F.data == "clan_roster")
+async def clan_roster_cb(call: types.CallbackQuery):
+    clan = get_clan_by_leader(call.from_user.id)
+    if not clan:
+        await call.answer("⚠️ Вы не лидер клана!", show_alert=True)
+        return
+
+    conn = sqlite3.connect("database.db")
+    cur = conn.cursor()
+    cur.execute("SELECT user_id, nickname, game_id, role FROM players WHERE clan_id = ?", (clan[0],))
+    members = cur.fetchall()
+    conn.close()
+
+    kb_list = []
+    for m in members:
+        if m[0] != call.from_user.id:  
+            kb_list.append([InlineKeyboardButton(text=f"❌ Исключить {m[1]}", callback_data=f"kick_{m[0]}")])
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=kb_list) if kb_list else None
+    members_str = "\n".join([f"• `{m[1]}` (ID: `{m[2]}`) — _{m[3]}_" for m in members])
+
+    await call.message.edit_text(
+        f"👥 **Управление ростером клана [{clan[1]}]**\n\n{members_str}",
+        reply_markup=kb, parse_mode="Markdown"
+    )
+    await call.answer()
+
+@dp.callback_query(F.data.startswith("kick_"))
+async def kick_member(call: types.CallbackQuery):
+    clan = get_clan_by_leader(call.from_user.id)
+    if not clan:
+        await call.answer("⚠️ Вы не лидер!", show_alert=True)
+        return
+    
+    target_id = int(call.data.split("_")[1])
+    conn = sqlite3.connect("database.db")
+    cur = conn.cursor()
+    cur.execute("UPDATE players SET clan_id = 0 WHERE user_id = ? AND clan_id = ?", (target_id, clan[0]))
+    conn.commit()
+    conn.close()
+
+    await call.answer("Игрок исключен из клана!")
+    await clan_roster_cb(call)
+
+@dp.callback_query(F.data == "clan_applications")
+async def clan_apps_cb(call: types.CallbackQuery):
+    clan = get_clan_by_leader(call.from_user.id)
+    if not clan:
+        await call.answer("⚠️ Вы не лидер!", show_alert=True)
+        return
+
+    conn = sqlite3.connect("database.db")
+    cur = conn.cursor()
+    cur.execute("SELECT id, user_id FROM clan_applications WHERE clan_id = ?", (clan[0],))
+    apps = cur.fetchall()
+    conn.close()
+
+    if not apps:
+        await call.message.edit_text("📩 Активных заявок в клан нет.")
+        await call.answer()
+        return
+
+    kb_list = []
+    text = "📩 **Заявки на вступление:**\n\n"
+    for app_id, u_id in apps:
+        p = get_player(u_id)
+        if p:
+            text += f"• `{p[0]}` (ID: `{p[1]}`)\n"
+            kb_list.append([
+                InlineKeyboardButton(text=f"✅ Принять {p[0]}", callback_data=f"app_accept_{app_id}_{u_id}"),
+                InlineKeyboardButton(text=f"❌ Отклонить", callback_data=f"app_deny_{app_id}")
+            ])
+
+    kb = InlineKeyboardMarkup(inline_keyboard=kb_list)
+    await call.message.edit_text(text, reply_markup=kb, parse_mode="Markdown")
+    await call.answer()
+
+@dp.callback_query(F.data.startswith("app_accept_"))
+async def accept_application(call: types.CallbackQuery):
+    clan = get_clan_by_leader(call.from_user.id)
+    if not clan:
+        await call.answer("⚠️ Ошибка доступа", show_alert=True)
+        return
+
+    _, _, app_id, user_id = call.data.split("_")
+    app_id, user_id = int(app_id), int(user_id)
+
+    conn = sqlite3.connect("database.db")
+    cur = conn.cursor()
+    cur.execute("UPDATE players SET clan_id = ? WHERE user_id = ?", (clan[0], user_id))
+    cur.execute("DELETE FROM clan_applications WHERE id = ?", (app_id,))
+    conn.commit()
+    conn.close()
+
+    await call.answer("Игрок принят в клан!")
+    try:
+        await bot.send_message(user_id, f"🎉 Ваша заявка в клан `[{clan[1]}]` одобрена! Добро пожаловать.")
+    except Exception:
+        pass
+    await clan_apps_cb(call)
+
+@dp.callback_query(F.data.startswith("app_deny_"))
+async def deny_application(call: types.CallbackQuery):
+    app_id = int(call.data.split("_")[2])
+    conn = sqlite3.connect("database.db")
+    cur = conn.cursor()
+    cur.execute("DELETE FROM clan_applications WHERE id = ?", (app_id,))
+    conn.commit()
+    conn.close()
+
+    await call.answer("Заявка отклонена.")
+    await clan_apps_cb(call)
+
+@dp.callback_query(F.data == "clan_avatar")
+async def clan_avatar_cb(call: types.CallbackQuery, state: FSMContext):
+    clan = get_clan_by_leader(call.from_user.id)
+    if not clan:
+        await call.answer("⚠️ Вы не лидер клана!", show_alert=True)
+        return
+
+    await call.message.answer("🖼 Отправьте новую **картинку (фото)** для аватара вашего клана:", reply_markup=cancel_keyboard())
+    await state.set_state(AvatarState.waiting_for_photo)
+    await call.answer()
+
+@dp.message(AvatarState.waiting_for_photo, F.photo)
+async def process_clan_avatar(message: types.Message, state: FSMContext):
+    clan = get_clan_by_leader(message.from_user.id)
+    if not clan:
+        await state.clear()
+        return
+
+    photo = message.photo[-1]
+    file_info = await bot.get_file(photo.file_id)
+    
+    os.makedirs("avatars", exist_ok=True)
+    avatar_path = f"avatars/clan_{clan[0]}.jpg"
+    await bot.download_file(file_info.file_path, avatar_path)
+
+    conn = sqlite3.connect("database.db")
+    cur = conn.cursor()
+    cur.execute("UPDATE clans SET avatar_path = ? WHERE clan_id = ?", (avatar_path, clan[0]))
+    conn.commit()
+    conn.close()
+
+    await state.clear()
+    await message.answer("✅ Аватарка клана успешно обновлена!", reply_markup=main_keyboard(message.from_user.id))
+
+@dp.callback_query(F.data == "clan_disband")
+async def clan_disband_cb(call: types.CallbackQuery):
+    clan = get_clan_by_leader(call.from_user.id)
+    if not clan:
+        await call.answer("⚠️ Вы не лидер!", show_alert=True)
+        return
+
+    conn = sqlite3.connect("database.db")
+    cur = conn.cursor()
+    cur.execute("UPDATE players SET clan_id = 0 WHERE clan_id = ?", (clan[0],))
+    cur.execute("DELETE FROM clans WHERE clan_id = ?", (clan[0],))
+    conn.commit()
+    conn.close()
+
+    await call.message.edit_text("❌ Клан был полностью распущен.", reply_markup=None)
+    await call.answer()
+
+@dp.callback_query(F.data == "leave_clan")
+async def leave_clan_cb(call: types.CallbackQuery):
+    p = get_player(call.from_user.id)
+    if not p or p[2] == 0:
+        await call.answer("⚠️ Вы не в клане", show_alert=True)
+        return
+
+    conn = sqlite3.connect("database.db")
+    cur = conn.cursor()
+    cur.execute("UPDATE players SET clan_id = 0 WHERE user_id = ?", (call.from_user.id,))
+    conn.commit()
+    conn.close()
+
+    await call.message.edit_text("🚪 Вы успешно покинули клан.")
+    await call.answer()
+
+# --- ПОИСК ПРАКА И VETO (С ХОСТОМ И ID) ---
 @dp.message(F.text == "⚔️ Найти Прак (Кланы)")
 async def search_clan_practice(message: types.Message, state: FSMContext):
     clan = get_clan_by_leader(message.from_user.id)
@@ -465,7 +723,7 @@ async def process_clan_time(message: types.Message, state: FSMContext):
         opp_clan_id = queues.pop(q_key)
         
         if is_blocked(clan_id, opp_clan_id) or is_blocked(opp_clan_id, clan_id):
-            await message.answer("⚠️ Найден противник из вашего черного списка. Поиск продолжен...")
+            await message.answer("⚠️ Найден противник из черного списка. Поиск продолжен...")
             queues[q_key] = clan_id
             return
 
@@ -473,20 +731,33 @@ async def process_clan_time(message: types.Message, state: FSMContext):
         c1 = get_clan(opp_clan_id)
         c2 = get_clan(clan_id)
 
+        # Получаем ID капитанов для вывода
+        p1_data = get_player(c1[3])
+        p2_data = get_player(c2[3])
+        p1_game_id = p1_data[1] if p1_data else "Не указан"
+        p2_game_id = p2_data[1] if p2_data else "Не указан"
+
+        # Рандомное определение хоста лобби
+        host_clan = random.choice([c1, c2])
+
         matches[match_id] = {
             "c1_id": c1[0], "c2_id": c2[0],
             "c1_tag": c1[1], "c2_tag": c2[1],
             "p1_leader": c1[3], "p2_leader": c2[3],
-            "mode": mode, "maps": MAPS_LIST.copy(), "turn": c1[3]
+            "mode": mode, "maps": MAPS_LIST.copy(), "turn": c1[3],
+            "host_tag": host_clan[1]
         }
 
         poster_bio = create_vs_poster(c1[8], c2[8], c1[1], c2[1])
 
         caption = (
             f"🔥 **КЛАНОВЫЙ ПРАК НАЙДЕН! [{mode}]** 🔥\n\n"
-            f"🛡 **{c1[2]}** [{c1[1]}] (Elo: {c1[4]})\n"
+            f"🛡 **{c1[2]}** `[{c1[1]}]` (Elo: {c1[4]})\n"
+            f"👤 Капитан: `{c1[2]}` | ID: `🔒 {p1_game_id}`\n"
             f"⚔️ **VS** ⚔️\n"
-            f"🛡 **{c2[2]}** [{c2[1]}] (Elo: {c2[4]})\n\n"
+            f"🛡 **{c2[2]}** `[{c2[1]}]` (Elo: {c2[4]})\n"
+            f"👤 Капитан: `{c2[2]}` | ID: `🔒 {p2_game_id}`\n\n"
+            f"🏰 **Хост лобби (создает комнату):** `[{host_clan[1]}] {host_clan[2]}`\n\n"
             f"🎯 Начинаем фазу банов карт (Veto)!"
         )
 
@@ -513,7 +784,8 @@ async def send_veto_turn(match_id):
         
         res_text = (
             f"🏁 **VETO ЗАВЕРШЕНО!**\n\n"
-            f"🗺 Игровая карта: **{final_map}**\n\n"
+            f"🗺 Игровая карта: **{final_map}**\n"
+            f"🏰 Создает лобби: **[{m['host_tag']}]**\n\n"
             f"Заходите в лобби Standoff 2. После игры нажмите кнопку ниже и пришлите скриншот результатов!"
         )
         kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -631,4 +903,4 @@ async def main():
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(main()) 
