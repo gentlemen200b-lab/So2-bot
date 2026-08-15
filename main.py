@@ -10,17 +10,27 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 
-# --- НАСТРОЙКА БАЗЫ ДАННЫХ ---
+# --- БАЗА ДАННЫХ ---
 def init_db():
     conn = sqlite3.connect("database.db")
     cursor = conn.cursor()
+    # Таблица игроков
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS players (
             user_id INTEGER PRIMARY KEY,
             nickname TEXT NOT NULL,
             game_id TEXT NOT NULL,
             clan_tag TEXT DEFAULT 'Нет',
-            rating INTEGER DEFAULT 1000
+            elo INTEGER DEFAULT 1000
+        )
+    """)
+    # Таблица кланов/команд
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS clans (
+            clan_tag TEXT PRIMARY KEY,
+            captain_id INTEGER,
+            roster TEXT,
+            elo INTEGER DEFAULT 1000
         )
     """)
     conn.commit()
@@ -30,8 +40,8 @@ def add_player(user_id, nickname, game_id, clan_tag):
     conn = sqlite3.connect("database.db")
     cursor = conn.cursor()
     cursor.execute("""
-        INSERT OR REPLACE INTO players (user_id, nickname, game_id, clan_tag, rating)
-        VALUES (?, ?, ?, ?, COALESCE((SELECT rating FROM players WHERE user_id = ?), 1000))
+        INSERT OR REPLACE INTO players (user_id, nickname, game_id, clan_tag, elo)
+        VALUES (?, ?, ?, ?, COALESCE((SELECT elo FROM players WHERE user_id = ?), 1000))
     """, (user_id, nickname, game_id, clan_tag, user_id))
     conn.commit()
     conn.close()
@@ -39,46 +49,67 @@ def add_player(user_id, nickname, game_id, clan_tag):
 def get_player(user_id):
     conn = sqlite3.connect("database.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT nickname, game_id, clan_tag, rating FROM players WHERE user_id = ?", (user_id,))
+    cursor.execute("SELECT nickname, game_id, clan_tag, elo FROM players WHERE user_id = ?", (user_id,))
     player = cursor.fetchone()
     conn.close()
     return player
 
-# --- СОСТОЯНИЯ РЕГИСТРАЦИИ (FSM) ---
+def get_top_players():
+    conn = sqlite3.connect("database.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT nickname, clan_tag, elo FROM players ORDER BY elo DESC LIMIT 10")
+    top = cursor.fetchall()
+    conn.close()
+    return top
+
+def get_top_clans():
+    conn = sqlite3.connect("database.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT clan_tag, elo FROM clans ORDER BY elo DESC LIMIT 10")
+    top = cursor.fetchall()
+    conn.close()
+    return top
+
+# --- FSM СОСТОЯНИЯ ---
 class Registration(StatesGroup):
     waiting_for_nickname = State()
     waiting_for_game_id = State()
     waiting_for_clan_tag = State()
 
-# --- ИНИЦИАЛИЗА БОТА ---
+# --- ИНИЦИАЛИЗА ---
 TOKEN = os.getenv("BOT_TOKEN")
 bot = Bot(token=TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
-# --- КНОПКИ ---
+# --- КЛАВИАТУРА ---
 def main_keyboard():
     kb = [
-        [KeyboardButton(text="📝 Регистрация / Изменить профиль")],
-        [KeyboardButton(text="👤 Мой профиль")]
+        [KeyboardButton(text="👤 Мой профиль"), KeyboardButton(text="📝 Регистрация / Профиль")],
+        [KeyboardButton(text="🏆 Топ Игроков"), KeyboardButton(text="🛡 Топ Кланов")],
+        [KeyboardButton(text="⚔️ Найти Прак (В разработке)")]
     ]
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
-# --- ОБРАБОТЧИКИ КОМАНД ---
+# --- ОБРАБОТЧИКИ ---
 @dp.message(Command("start"))
 async def start_cmd(message: types.Message, state: FSMContext):
     await state.clear()
-    await message.answer(
-        "👋 **Привет! Добро пожаловать в проект «Битва»!**\n\n"
-        "Этот бот предназначен для учета матчей, подсчета рейтинга игроков и отслеживания вашей статистики.\n\n"
-        "Чтобы участвовать в матчах и попадать в общий рейтинг, пройдите быструю регистрацию.",
-        parse_mode="Markdown",
-        reply_markup=main_keyboard()
+    text = (
+        "⚔️ **ДОБРО ПОЖАЛОВАТЬ НА АРЕНУ «БИТВА»** ⚔️\n\n"
+        "🏛 *Официальная киберспортивная система праков и рейтингов Standoff 2.*\n\n"
+        "Здесь вы можете:\n"
+        "▫️ Зарегистрировать свой профиль и клан\n"
+        "▫️ Находить праки и участвовать в турнирах\n"
+        "▫️ Банить карты в Veto-режиме\n"
+        "▫️ Поднимать личный и клановый **Elo рейтинг**\n\n"
+        "👇 *Воспользуйтесь меню ниже для навигации:*"
     )
+    await message.answer(text, parse_mode="Markdown", reply_markup=main_keyboard())
 
-@dp.message(F.text == "📝 Регистрация / Изменить профиль")
+@dp.message(F.text == "📝 Регистрация / Профиль")
 async def start_registration(message: types.Message, state: FSMContext):
     await message.answer(
-        "Шаг 1/3: Введите ваш **игровой никнейм**:",
+        "📝 **Шаг 1/3:** Введите ваш игровой **Никнейм**:",
         parse_mode="Markdown",
         reply_markup=ReplyKeyboardRemove()
     )
@@ -87,13 +118,13 @@ async def start_registration(message: types.Message, state: FSMContext):
 @dp.message(Registration.waiting_for_nickname)
 async def process_nickname(message: types.Message, state: FSMContext):
     await state.update_data(nickname=message.text.strip())
-    await message.answer("Шаг 2/3: Введите ваш **игровой ID** (числа из профиля):", parse_mode="Markdown")
+    await message.answer("🆔 **Шаг 2/3:** Введите ваш **Игровой ID** (только цифры):", parse_mode="Markdown")
     await state.set_state(Registration.waiting_for_game_id)
 
 @dp.message(Registration.waiting_for_game_id)
 async def process_game_id(message: types.Message, state: FSMContext):
     if not message.text.isdigit():
-        await message.answer("⚠️ Игровой ID должен состоять только из цифр! Попробуйте еще раз:")
+        await message.answer("⚠️ **ID должен состоять только из цифр!** Попробуйте еще раз:")
         return
     await state.update_data(game_id=message.text.strip())
 
@@ -102,7 +133,7 @@ async def process_game_id(message: types.Message, state: FSMContext):
         resize_keyboard=True
     )
     await message.answer(
-        "Шаг 3/3: Введите ваш **клан-тег** (например, `[ABC]`) или нажмите **Пропустить**:",
+        "🏷 **Шаг 3/3:** Введите ваш **Клан-тег** (например, `[ABC]`) или нажмите **Пропустить**:",
         parse_mode="Markdown",
         reply_markup=skip_kb
     )
@@ -122,12 +153,12 @@ async def process_clan_tag(message: types.Message, state: FSMContext):
     
     await state.clear()
     await message.answer(
-        f"✅ **Регистрация успешно завершена!**\n\n"
-        f"👤 **Ник:** {data['nickname']}\n"
-        f"🆔 **ID:** {data['game_id']}\n"
-        f"🏷 **Клан-тег:** {clan_tag}\n"
-        f"🏆 **Начальный рейтинг:** 1000 MMR\n\n"
-        f"Теперь вы автоматически состоите в системе рейтинга!",
+        f"🎉 **РЕГИСТРАЦИЯ УСПЕШНО ЗАВЕРШЕНА!**\n\n"
+        f"👤 **Ник:** `{data['nickname']}`\n"
+        f"🆔 **ID:** `{data['game_id']}`\n"
+        f"🏷 **Клан:** `{clan_tag}`\n"
+        f"⚡️ **Стартовый Elo:** `1000`\n\n"
+        f"🔥 Вы внесены в единую систему рейтинга!",
         parse_mode="Markdown",
         reply_markup=main_keyboard()
     )
@@ -136,19 +167,47 @@ async def process_clan_tag(message: types.Message, state: FSMContext):
 async def show_profile(message: types.Message):
     player = get_player(message.from_user.id)
     if player:
-        nickname, game_id, clan_tag, rating = player
+        nickname, game_id, clan_tag, elo = player
         await message.answer(
-            f"📊 **Ваш профиль:**\n\n"
-            f"👤 **Ник:** {nickname}\n"
-            f"🆔 **ID:** {game_id}\n"
-            f"🏷 **Клан:** {clan_tag}\n"
-            f"🏆 **Рейтинг:** {rating} MMR",
+            f"📊 **ЛИЧНЫЙ ПРОФИЛЬ ИГРОКА**\n\n"
+            f"👤 **Никнейм:** `{nickname}`\n"
+            f"🆔 **Игровой ID:** `{game_id}`\n"
+            f"🏷 **Клан:** `{clan_tag}`\n"
+            f"⚡️ **Рейтинг Elo:** `{elo}`",
             parse_mode="Markdown"
         )
     else:
-        await message.answer("⚠️ Вы еще не зарегистрированы. Нажмите кнопку **📝 Регистрация / Изменить профиль** ниже.")
+        await message.answer("⚠️ Вы еще не зарегистрированы. Нажмите **📝 Регистрация / Профиль**.")
 
-# --- ВЕБ-СЕРВЕР ДЛЯ RENDER ---
+@dp.message(F.text == "🏆 Топ Игроков")
+async def show_top_players(message: types.Message):
+    top = get_top_players()
+    if not top:
+        await message.answer("🏆 **Топ игроков пока пуст. Будь первым!**", parse_mode="Markdown")
+        return
+    
+    text = "🏆 **ТОП-10 ИГРОКОВ ПО ELO:**\n\n"
+    medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+    for i, (nick, clan, elo) in enumerate(top):
+        clan_str = f"[{clan}] " if clan != "Нет" else ""
+        text += f"{medals[i]} **{clan_str}{nick}** — `{elo} Elo`\n"
+    
+    await message.answer(text, parse_mode="Markdown")
+
+@dp.message(F.text == "🛡 Топ Кланов")
+async def show_top_clans(message: types.Message):
+    top = get_top_clans()
+    if not top:
+        await message.answer("🛡 **Зарегистрированных кланов пока нет.**", parse_mode="Markdown")
+        return
+    
+    text = "🛡 **ТОП КЛАНОВ ПО ELO:**\n\n"
+    for i, (clan_tag, elo) in enumerate(top, 1):
+        text += f"**{i}. {clan_tag}** — `{elo} Elo`\n"
+    
+    await message.answer(text, parse_mode="Markdown")
+
+# --- СЕРВЕР ---
 async def handle(request):
     return web.Response(text="Bot is running!")
 
@@ -169,4 +228,5 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
