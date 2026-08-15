@@ -1212,12 +1212,12 @@ async def process_elo_change(message: types.Message, state: FSMContext):
 
     await message.answer(f"✅ Баланс клана **{name}** `[{tag}]` изменен!\nСтарый Elo: `{current_elo}` ➡️ Новый Elo: `{new_elo}`", parse_mode="Markdown", reply_markup=main_keyboard(message.from_user.id))
 
-# --- АНАЛИЗ СКРИНШОТА ЧЕРЕЗ ИИ ---
+# --- АНАЛИЗ СКРИНШОТА ЧЕРЕЗ ИИ (MVP И СТАТИСТИКА) ---
 @dp.callback_query(F.data.startswith("upscreen_"))
 async def trigger_screen_upload(call: types.CallbackQuery, state: FSMContext):
     match_id = call.data.split("_")[1]
     await state.update_data(active_match_id=match_id)
-    await call.message.answer("📸 Пришлите **скриншот таблицы результатов** из Standoff 2 для автоматического анализа матча:")
+    await call.message.answer("📸 Пришлите **скриншот таблицы результатов** из Standoff 2, и ИИ автоматически определит MVP матча и лучших игроков по K/D:")
     await call.answer()
 
 @dp.message(F.photo)
@@ -1232,7 +1232,7 @@ async def handle_screenshot_ai(message: types.Message, state: FSMContext):
         await message.answer("⚠️ GEMINI_API_KEY не настроен в системе.")
         return
 
-    await message.answer("🤖 **ИИ-Арбитр анализирует таблицу результатов матча...**")
+    await message.answer("🤖 **ИИ-Арбитр анализирует таблицу результатов, считает K/D и определяет MVP...**")
 
     photo = message.photo[-1]
     file_info = await bot.get_file(photo.file_id)
@@ -1241,16 +1241,20 @@ async def handle_screenshot_ai(message: types.Message, state: FSMContext):
 
     try:
         model = genai.GenerativeModel('gemini-1.5-flash')
-        prompt = "Проанализируй скриншот результатов Standoff 2. Назови победителя, счет матча, лучшие киллы и MVP."
+        prompt = (
+            "Проанализируй скриншот результатов матча Standoff 2. "
+            "Выдели победителя матча, точный счет, а также определи MVP матча и топ- игроков с лучшим K/D (отношением убийств к смертям). "
+            "Оформи ответ красиво и структурировано с помощью Markdown."
+        )
         
         image_part = {"mime_type": "image/jpeg", "data": photo_bytes}
         response = model.generate_content([prompt, image_part])
         
-        await message.answer(f"📊 **ОТЧЕТ ИИ-АРБИТРА ПО МАТЧУ:**\n\n{response.text}", parse_mode="Markdown")
+        await message.answer(f"📊 **ИТОГОВЫЙ ОТЧЕТ МАТЧА ОТ ИИ:**\n\n{response.text}", parse_mode="Markdown")
         await state.clear()
     except Exception as e:
         logging.error(f"Ошибка ИИ: {e}")
-        await message.answer("⚠️ Не удалось прочитать скриншот. Отчет передан администрации.")
+        await message.answer("⚠️ Не удалось прочитать скриншот. Попробуйте отправить более четкое фото.")
 
 async def handle(request):
     return web.Response(text="Standoff 2 Clan Bot Pro is Running!")
@@ -1272,6 +1276,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-
-
