@@ -1,19 +1,11 @@
-import os
-from aiohttp import web
-
-async def handle(request):
-    return web.Response(text="Bot is running!")
-
-app = web.Application()
-app.router.add_get('/', handle)
-
 import asyncio
 import logging
+import os
+from aiohttp import web
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
-from aiohttp import web
 
-TOKEN = "8878586697:AAGcr1CXBMqSvnSLMQ1B2..." # твой полный токен
+TOKEN = os.getenv("BOT_TOKEN")
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
@@ -44,5 +36,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-
