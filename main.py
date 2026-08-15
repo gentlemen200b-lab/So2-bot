@@ -1,5 +1,4 @@
 import asyncio
-io_bytes_io = None
 import io
 import logging
 import os
@@ -30,8 +29,8 @@ if GEMINI_KEY:
 
 MAPS_LIST = ["Sandstone", "Province", "Rust", "Dune", "Hanami", "Prison", "Breeze"]
 
-queues = {"fast": []}     # {"fast": [clan_id], "time_20:00": [clan_id]}
-matches = {}    # { match_id: data }
+queues = {"fast": []}
+matches = {}
 
 def init_db():
     conn = sqlite3.connect("database.db")
@@ -187,6 +186,11 @@ class ClanJoinState(StatesGroup):
 
 class AvatarState(StatesGroup):
     waiting_for_photo = State()
+
+class AdminStates(StatesGroup):
+    waiting_for_broadcast = State()
+    waiting_for_ban_id = State()
+    waiting_for_elo_data = State()
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
@@ -888,6 +892,177 @@ async def show_clan_top(message: types.Message):
         text += f"**{i}. [{tag}] {name}** — `{elo} Elo` | 🔥 Стрик: `{streak}` | (В: {w} / П: {l})\n"
     await message.answer(text, parse_mode="Markdown")
 
+# --- АДМИН ПАНЕЛЬ ---
+@dp.message(F.text == "👑 Админ Панель")
+async def admin_panel_handler(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("⚠️ У вас нет доступа к этой панели.")
+        return
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats")],
+        [InlineKeyboardButton(text="📢 Сделать рассылку", callback_data="admin_broadcast")],
+        [InlineKeyboardButton(text="🔨 Забанить игрока", callback_data="admin_ban")],
+        [InlineKeyboardButton(text="⚡ Изменить Elo клана", callback_data="admin_elo")]
+    ])
+    await message.answer("👑 **Панель Администратора**\nВыберите нужное действие:", reply_markup=kb, parse_mode="Markdown")
+
+@dp.callback_query(F.data == "admin_stats")
+async def admin_stats_callback(call: types.CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        return
+
+    conn = sqlite3.connect("database.db")
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM players")
+    players_count = cur.fetchone()[0]
+    
+    cur.execute("SELECT COUNT(*) FROM clans")
+    clans_count = cur.fetchone()[0]
+    
+    cur.execute("SELECT COUNT(*) FROM match_history")
+    matches_count = cur.fetchone()[0]
+    conn.close()
+
+    text = (
+        f"📊 **Статистика бота:**\n\n"
+        f"👥 Зарегистрированных игроков: `{players_count}`\n"
+        f"🛡 Созданных кланов: `{clans_count}`\n"
+        f"⚔️ Всего сыгранных матчей: `{matches_count}`"
+    )
+    await call.message.edit_text(text, parse_mode="Markdown")
+    await call.answer()
+
+@dp.callback_query(F.data == "admin_broadcast")
+async def admin_broadcast_callback(call: types.CallbackQuery, state: FSMContext):
+    if call.from_user.id != ADMIN_ID:
+        return
+
+    await call.message.answer("📢 Введите текст для рассылки всем пользователям бота:", reply_markup=cancel_keyboard())
+    await state.set_state(AdminStates.waiting_for_broadcast)
+    await call.answer()
+
+@dp.message(AdminStates.waiting_for_broadcast)
+async def process_broadcast(message: types.Message, state: FSMContext):
+    if message.text == "❌ Отмена":
+        await cancel_handler(message, state)
+        return
+
+    text = message.text
+    await state.clear()
+
+    conn = sqlite3.connect("database.db")
+    cur = conn.cursor()
+    cur.execute("SELECT user_id FROM players")
+    users = cur.fetchall()
+    conn.close()
+
+    success = 0
+    blocked = 0
+
+    status_msg = await message.answer("📢 Рассылка началась...")
+
+    for (u_id,) in users:
+        try:
+            await bot.send_message(u_id, f"📢 **Объявление от администрации:**\n\n{text}", parse_mode="Markdown")
+            success += 1
+            await asyncio.sleep(0.05)
+        except Exception:
+            blocked += 1
+
+    await status_msg.edit_text(f"✅ **Рассылка завершена!**\n\n📬 Успешно доставлено: `{success}`\n🚫 Заблокировали бота: `{blocked}`", parse_mode="Markdown")
+    await message.answer("Главное меню:", reply_markup=main_keyboard(message.from_user.id))
+
+@dp.callback_query(F.data == "admin_ban")
+async def admin_ban_callback(call: types.CallbackQuery, state: FSMContext):
+    if call.from_user.id != ADMIN_ID:
+        return
+
+    await call.message.answer("🔨 Введите `user_id` игрока, которого хотите забанить/разбанить:", parse_mode="Markdown", reply_markup=cancel_keyboard())
+    await state.set_state(AdminStates.waiting_for_ban_id)
+    await call.answer()
+
+@dp.message(AdminStates.waiting_for_ban_id)
+async def process_ban_player(message: types.Message, state: FSMContext):
+    if message.text == "❌ Отмена":
+        await cancel_handler(message, state)
+        return
+
+    if not message.text.isdigit():
+        await message.answer("⚠️ ID должен состоять только из цифр!")
+        return
+
+    target_id = int(message.text)
+    await state.clear()
+
+    conn = sqlite3.connect("database.db")
+    cur = conn.cursor()
+    cur.execute("SELECT is_banned, nickname FROM players WHERE user_id = ?", (target_id,))
+    res = cur.fetchone()
+
+    if not res:
+        conn.close()
+        await message.answer("⚠️ Игрок с таким ID не найден в базе.")
+        return
+
+    is_banned, nick = res
+    new_status = 0 if is_banned == 1 else 1
+    
+    cur.execute("UPDATE players SET is_banned = ? WHERE user_id = ?", (new_status, target_id))
+    conn.commit()
+    conn.close()
+
+    status_text = "разбанен ✅" if new_status == 0 else "забанен 🔨"
+    await message.answer(f"👤 Игрок `{nick}` (ID: `{target_id}`) успешно {status_text}.", parse_mode="Markdown", reply_markup=main_keyboard(message.from_user.id))
+
+@dp.callback_query(F.data == "admin_elo")
+async def admin_elo_callback(call: types.CallbackQuery, state: FSMContext):
+    if call.from_user.id != ADMIN_ID:
+        return
+
+    await call.message.answer("⚡ Введите данные в формате: `ID_клана +/-Количество_Elo`\n(Пример: `1 +150` или `2 -50`)", parse_mode="Markdown", reply_markup=cancel_keyboard())
+    await state.set_state(AdminStates.waiting_for_elo_data)
+    await call.answer()
+
+@dp.message(AdminStates.waiting_for_elo_data)
+async def process_elo_change(message: types.Message, state: FSMContext):
+    if message.text == "❌ Отмена":
+        await cancel_handler(message, state)
+        return
+
+    parts = message.text.split()
+    if len(parts) != 2 or not parts[0].isdigit():
+        await message.answer("⚠️ Неверный формат! Пример: `1 +100`")
+        return
+
+    clan_id = int(parts[0])
+    try:
+        elo_change = int(parts[1])
+    except ValueError:
+        await message.answer("⚠️ Значение Elo должно быть числом (например, `+50` или `-50`)!")
+        return
+
+    await state.clear()
+
+    conn = sqlite3.connect("database.db")
+    cur = conn.cursor()
+    cur.execute("SELECT elo, clan_name, clan_tag FROM clans WHERE clan_id = ?", (clan_id,))
+    clan = cur.fetchone()
+
+    if not clan:
+        conn.close()
+        await message.answer("⚠️ Клан с таким ID не найден.")
+        return
+
+    current_elo, name, tag = clan
+    new_elo = max(0, current_elo + elo_change)
+
+    cur.execute("UPDATE clans SET elo = ? WHERE clan_id = ?", (new_elo, clan_id))
+    conn.commit()
+    conn.close()
+
+    await message.answer(f"✅ Баланс клана **{name}** `[{tag}]` изменен!\nСтарый Elo: `{current_elo}` ➡️ Новый Elo: `{new_elo}`", parse_mode="Markdown", reply_markup=main_keyboard(message.from_user.id))
+
 # --- АНАЛИЗ СКРИНШОТА ЧЕРЕЗ ИИ ---
 @dp.callback_query(F.data.startswith("upscreen_"))
 async def trigger_screen_upload(call: types.CallbackQuery, state: FSMContext):
@@ -948,4 +1123,5 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+    
 
