@@ -28,7 +28,6 @@ if GEMINI_KEY:
     genai.configure(api_key=GEMINI_KEY)
 
 MAPS_LIST = ["Sandstone", "Province", "Rust", "Dune", "Hanami", "Prison", "Breeze"]
-COUNTRIES = ["🇰🇿 Казахстан", "🇷🇺 Россия", "🇺🇿 Узбекистан", "🇰🇬 Кыргызстан", "🇧🇾 Беларусь", "🇪🇺 Европа"]
 
 queues = {}     # { "5x5_18:00": clan_id }
 matches = {}    # { match_id: data }
@@ -51,6 +50,8 @@ def init_db():
             kills INTEGER DEFAULT 0,
             deaths INTEGER DEFAULT 0,
             mvp_count INTEGER DEFAULT 0,
+            wins INTEGER DEFAULT 0,
+            losses INTEGER DEFAULT 0,
             is_banned INTEGER DEFAULT 0
         )
     """)
@@ -66,6 +67,19 @@ def init_db():
             wins INTEGER DEFAULT 0,
             losses INTEGER DEFAULT 0,
             avatar_path TEXT DEFAULT ''
+        )
+    """)
+
+    # История
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS match_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            opponent_nick TEXT,
+            map_name TEXT,
+            result TEXT,
+            elo_change INTEGER,
+            date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
     
@@ -85,7 +99,7 @@ def safe_send_message(bot, user_id, text, **kwargs):
 def get_player(user_id):
     conn = sqlite3.connect("database.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT nickname, game_id, clan_id, device, role, country, kills, deaths, mvp_count, is_banned FROM players WHERE user_id = ?", (user_id,))
+    cursor.execute("SELECT nickname, game_id, clan_id, device, role, country, kills, deaths, mvp_count, wins, losses, is_banned FROM players WHERE user_id = ?", (user_id,))
     res = cursor.fetchone()
     conn.close()
     return res
@@ -114,11 +128,10 @@ def get_top_clans():
     conn.close()
     return res
 
-# --- ГЕНЕРАЦИЯ ВС-АФИШИ (VS POSTER) ---
+# --- ГЕНЕРАЦИЯ VS-ПОСТЕРА ---
 def create_vs_poster(clan1_avatar, clan2_avatar, tag1, tag2):
     canvas = Image.new('RGB', (600, 300), color=(20, 20, 26))
     
-    # Загружаем аватарку или дефолтный квадрат
     def load_avatar(path):
         if path and os.path.exists(path):
             img = Image.open(path).convert('RGB')
@@ -134,8 +147,8 @@ def create_vs_poster(clan1_avatar, clan2_avatar, tag1, tag2):
 
     draw = ImageDraw.Draw(canvas)
     draw.text((270, 130), "VS", fill=(255, 69, 0))
-    draw.text((80, 260), f"[{tag1}]", fill=(255, 255, 255))
-    draw.text((420, 260), f"[{tag2}]", fill=(255, 255, 255))
+    draw.text((70, 260), f"[{tag1}]", fill=(255, 255, 255))
+    draw.text((410, 260), f"[{tag2}]", fill=(255, 255, 255))
 
     bio = io.BytesIO()
     bio.name = 'vs_poster.png'
@@ -148,6 +161,8 @@ class Registration(StatesGroup):
     waiting_for_nickname = State()
     waiting_for_game_id = State()
     waiting_for_country = State()
+    waiting_for_device = State()
+    waiting_for_role = State()
 
 class CreateClanState(StatesGroup):
     waiting_for_tag = State()
@@ -160,8 +175,8 @@ class PracticeSearch(StatesGroup):
     waiting_for_mode = State()
     waiting_for_time = State()
 
-class ScreenProcessState(StatesGroup):
-    waiting_for_photo = State()
+class ReportState(StatesGroup):
+    waiting_for_reason = State()
 
 # --- ИНИЦИАЛИЗА AIOGRAM ---
 bot = Bot(token=BOT_TOKEN)
@@ -174,7 +189,8 @@ def main_keyboard(user_id):
     kb = [
         [KeyboardButton(text="⚔️ Найти Прак (Кланы)"), KeyboardButton(text="🛡 Мой Клан")],
         [KeyboardButton(text="👤 Мой профиль"), KeyboardButton(text="📝 Регистрация")],
-        [KeyboardButton(text="🏆 Топ Кланов"), KeyboardButton(text="🖼 Загрузить Аватар Клана")]
+        [KeyboardButton(text="📜 История матчей"), KeyboardButton(text="🏆 Топ Кланов")],
+        [KeyboardButton(text="🖼 Загрузить Аватар Клана")]
     ]
     if user_id == ADMIN_ID:
         kb.append([KeyboardButton(text="👑 Админ Панель")])
@@ -190,20 +206,20 @@ async def start_cmd(message: types.Message, state: FSMContext):
         parse_mode="Markdown", reply_markup=main_keyboard(message.from_user.id)
     )
 
-# --- РЕГИСТРАЦИЯ ИГРОКА ---
+# --- ПОЛНАЯ РЕГИСТРАЦИЯ ИГРОКА ---
 @dp.message(F.text == "📝 Регистрация")
 async def start_reg(message: types.Message, state: FSMContext):
     p = get_player(message.from_user.id)
     if p:
         await message.answer("⚠️ Вы уже зарегистрированы!")
         return
-    await message.answer("📝 Введите ваш **Игровой Никнейм** в Standoff 2:", parse_mode="Markdown")
+    await message.answer("📝 **Шаг 1/5:** Введите ваш **Игровой Никнейм** в Standoff 2:", parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
     await state.set_state(Registration.waiting_for_nickname)
 
 @dp.message(Registration.waiting_for_nickname)
 async def process_nick(message: types.Message, state: FSMContext):
     await state.update_data(nickname=message.text.strip())
-    await message.answer("🆔 Введите ваш **Игровой ID** (только цифры):", parse_mode="Markdown")
+    await message.answer("🆔 **Шаг 2/5:** Введите ваш **Игровой ID** (только цифры):", parse_mode="Markdown")
     await state.set_state(Registration.waiting_for_game_id)
 
 @dp.message(Registration.waiting_for_game_id)
@@ -211,21 +227,110 @@ async def process_id(message: types.Message, state: FSMContext):
     if not message.text.isdigit():
         await message.answer("⚠️ ID должен состоять только из цифр!")
         return
+    await state.update_data(game_id=message.text.strip())
+    
+    country_kb = ReplyKeyboardMarkup(keyboard=[
+        [KeyboardButton(text="🇰🇿 Казахстан"), KeyboardButton(text="🇷🇺 Россия")],
+        [KeyboardButton(text="🇺🇿 Узбекистан"), KeyboardButton(text="🇰🇬 Кыргызстан")],
+        [KeyboardButton(text="🇧🇾 Беларусь"), KeyboardButton(text="🇪🇺 Европа")]
+    ], resize_keyboard=True)
+    
+    await message.answer("🌍 **Шаг 3/5:** Выберите вашу **Страну / Регион**:", parse_mode="Markdown", reply_markup=country_kb)
+    await state.set_state(Registration.waiting_for_country)
+
+@dp.message(Registration.waiting_for_country)
+async def process_country(message: types.Message, state: FSMContext):
+    await state.update_data(country=message.text.strip())
+
+    dev_kb = ReplyKeyboardMarkup(keyboard=[
+        [KeyboardButton(text="📱 Phone (60 FPS)"), KeyboardButton(text="📱 Phone (90 FPS)")],
+        [KeyboardButton(text="📱 Phone (120 FPS)"), KeyboardButton(text="📱 iPad (120 FPS)")]
+    ], resize_keyboard=True)
+    
+    await message.answer("📱 **Шаг 4/5:** Выберите ваше **Устройство / FPS**:", parse_mode="Markdown", reply_markup=dev_kb)
+    await state.set_state(Registration.waiting_for_device)
+
+@dp.message(Registration.waiting_for_device)
+async def process_device(message: types.Message, state: FSMContext):
+    await state.update_data(device=message.text.strip())
+    
+    role_kb = ReplyKeyboardMarkup(keyboard=[
+        [KeyboardButton(text="👑 Captain (IGL)"), KeyboardButton(text="🎯 Sniper (AWP)")],
+        [KeyboardButton(text="💥 Entry Fragger"), KeyboardButton(text="🔫 Rifler / Support")]
+    ], resize_keyboard=True)
+    
+    await message.answer("🎯 **Шаг 5/5:** Выберите вашу **Основную роль**:", parse_mode="Markdown", reply_markup=role_kb)
+    await state.set_state(Registration.waiting_for_role)
+
+@dp.message(Registration.waiting_for_role)
+async def process_role(message: types.Message, state: FSMContext):
+    role = message.text.strip()
     data = await state.get_data()
     
     conn = sqlite3.connect("database.db")
     c = conn.cursor()
-    c.execute("INSERT OR REPLACE INTO players (user_id, nickname, game_id) VALUES (?, ?, ?)",
-              (message.from_user.id, data["nickname"], message.text.strip()))
+    c.execute("""
+        INSERT OR REPLACE INTO players (user_id, nickname, game_id, country, device, role)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (message.from_user.id, data["nickname"], data["game_id"], data["country"], data["device"], role))
     conn.commit()
     conn.close()
     
     await state.clear()
-    await message.answer("🎉 **Регистрация завершена!** Теперь вы можете вступить в клан или создать свой.", parse_mode="Markdown", reply_markup=main_keyboard(message.from_user.id))
+    await message.answer("🎉 **Регистрация успешно завершена!** Теперь вы можете вступить в клан или создать свой.", parse_mode="Markdown", reply_markup=main_keyboard(message.from_user.id))
+
+# --- РАБОТАЮЩИЙ ПРОФИЛЬ ИГРОКА ---
+@dp.message(F.text == "👤 Мой профиль")
+async def show_profile(message: types.Message):
+    p = get_player(message.from_user.id)
+    if not p:
+        await message.answer("⚠️ Вы еще не зарегистрированы! Нажмите «📝 Регистрация»")
+        return
+
+    clan_tag = "Нет"
+    if p[2] != 0:
+        c = get_clan(p[2])
+        if c:
+            clan_tag = c[1]
+
+    kills = p[6]
+    deaths = p[7]
+    kd = round(kills / deaths, 2) if deaths > 0 else kills
+
+    text = (
+        f"👤 **ПРОФИЛЬ ИГРОКА**\n\n"
+        f"Ник: `{p[0]}` | ID: `{p[1]}`\n"
+        f"🏷 Клан: `[{clan_tag}]` | 🌍 Регион: `{p[5]}`\n"
+        f"📱 Device: `{p[3]}` | 🎯 Роль: `{p[4]}`\n\n"
+        f"⚔️ **Личная статистика в праках:**\n"
+        f"🎯 Киллы: `{kills}` | 💀 Смерти: `{deaths}` (KD: `{kd}`)\n"
+        f"🌟 MVP Награды: `{p[8]}`\n"
+        f"📊 Игры: Побед: `{p[9]}` | Поражений: `{p[10]}`"
+    )
+    await message.answer(text, parse_mode="Markdown")
+
+# --- ИСТОРИЯ МАТЧЕЙ ---
+@dp.message(F.text == "📜 История матчей")
+async def show_history(message: types.Message):
+    conn = sqlite3.connect("database.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT opponent_nick, map_name, result, elo_change, date FROM match_history WHERE user_id = ? ORDER BY id DESC LIMIT 5", (message.from_user.id,))
+    history = cursor.fetchall()
+    conn.close()
+
+    if not history:
+        await message.answer("📜 Ваша история матчей пока пуста.")
+        return
+
+    text = "📜 **ПОСЛЕДНИЕ 5 МАТЧЕЙ КЛАНА:**\n\n"
+    for opp, map_n, res, elo, dt in history:
+        icon = "🟢" if res == "ПОБЕДА" else "🔴"
+        text += f"{icon} **vs {opp}** | Карта: `{map_n}`\nИтог: {res} ({elo:+d} Elo) | `{dt}`\n\n"
+    await message.answer(text, parse_mode="Markdown")
 
 # --- КЛАНОВАЯ СИСТЕМА ---
 @dp.message(F.text == "🛡 Мой Клан")
-async def my_clan(message: types.Message, state: FSMContext):
+async def my_clan(message: types.Message):
     p = get_player(message.from_user.id)
     if not p:
         await message.answer("⚠️ Сначала пройдите регистрацию!")
@@ -311,7 +416,7 @@ async def process_avatar_photo(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer("✅ **Аватарка клана успешно обновлена!** Теперь она будет отображаться на афишах VS во время праков.", parse_mode="Markdown")
 
-# --- ПОИСК КЛАНОВЫХ ПРАКОВ ВЫЗОВ ---
+# --- ПОИСК КЛАНОВЫХ ПРАКОВ ---
 @dp.message(F.text == "⚔️ Найти Прак (Кланы)")
 async def search_clan_practice(message: types.Message, state: FSMContext):
     clan = get_clan_by_leader(message.from_user.id)
@@ -354,7 +459,6 @@ async def process_clan_time(message: types.Message, state: FSMContext):
             "mode": mode, "maps": MAPS_LIST.copy(), "turn": c1[3]
         }
 
-        # Генерируем VS-Афишу с аватарками
         poster_bio = create_vs_poster(c1[7], c2[7], c1[1], c2[1])
 
         caption = (
@@ -362,10 +466,13 @@ async def process_clan_time(message: types.Message, state: FSMContext):
             f"🛡 **{c1[2]}** [{c1[1]}] (Elo: {c1[4]})\n"
             f"⚔️ **VS** ⚔️\n"
             f"🛡 **{c2[2]}** [{c2[1]}] (Elo: {c2[4]})\n\n"
-            f"Готовы к бану карт Veto?"
+            f"Капитаны, отправьте скриншот результатов игры после матча!"
         )
 
-        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🎯 Начать Veto", callback_data=f"startveto_{match_id}")]])
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📸 Отправить скриншот", callback_data=f"upscreen_{match_id}")],
+            [InlineKeyboardButton(text="⚠️ Пожаловаться / Репорт", callback_data=f"rep_{match_id}")]
+        ])
 
         await bot.send_photo(c1[3], photo=types.BufferedInputFile(poster_bio.getvalue(), filename="vs.png"), caption=caption, reply_markup=kb, parse_mode="Markdown")
         await bot.send_photo(c2[3], photo=types.BufferedInputFile(poster_bio.getvalue(), filename="vs.png"), caption=caption, reply_markup=kb, parse_mode="Markdown")
@@ -382,22 +489,58 @@ async def show_clan_top(message: types.Message):
         text += f"**{i}. [{tag}] {name}** — `{elo} Elo` (Вин: {w} / Лос: {l})\n"
     await message.answer(text, parse_mode="Markdown")
 
+# --- СИСТЕМА ЖАЛОБ ---
+@dp.callback_query(F.data.startswith("rep_"))
+async def handle_report(call: types.CallbackQuery, state: FSMContext):
+    match_id = call.data.split("_")[1]
+    await state.update_data(rep_match_id=match_id)
+    await call.message.answer("⚠️ Опишите причину жалобы (например: *Соперник не заходит в лобби*, *Ложный счет*):")
+    await state.set_state(ReportState.waiting_for_reason)
+    await call.answer()
+
+@dp.message(ReportState.waiting_for_reason)
+async def process_report(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    match_id = data.get("rep_match_id", "Неизвестно")
+    reason = message.text.strip()
+    await state.clear()
+    await message.answer("✅ Ваша жалоба отправлена Администратору.")
+
+    if ADMIN_ID != 0:
+        await safe_send_message(bot, ADMIN_ID, f"🚨 **ЖАЛОБА НА МАТЧ #{match_id}**\nОт: `{message.from_user.id}`\nПричина: {reason}", parse_mode="Markdown")
+
+# --- АДМИН ПАНЕЛЬ ---
+@dp.message(F.text == "👑 Админ Панель")
+async def admin_panel(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    text = (
+        "👑 **АДМИН-ПАНЕЛЬ УПРАВЛЕНИЯ**\n\n"
+        "🔹 `/give_elo <clan_id> <elo>` — Изменить Elo клану\n"
+        "🔹 `/ban_player <user_id>` — Заблокировать нарушителя\n"
+        "🔹 `/unban_player <user_id>` — Разблокировать"
+    )
+    await message.answer(text, parse_mode="Markdown")
+
 # --- СЧИТЫВАНИЕ СКРИНШОТА ИИ (GEMINI API) ---
-@dp.callback_query(F.data.startswith("startveto_"))
+@dp.callback_query(F.data.startswith("upscreen_"))
 async def trigger_screen_upload(call: types.CallbackQuery, state: FSMContext):
     match_id = call.data.split("_")[1]
     await state.update_data(active_match_id=match_id)
-    await call.message.answer("📸 После завершения прака пришлете сюда **скриншот таблицы результатов** Standoff 2.\nИИ автоматически разберет K/D и спасет от спорных ситуаций!")
+    await call.message.answer("📸 Пришлите **скриншот таблицы результатов** Standoff 2 прямо в чат:")
     await call.answer()
 
 @dp.message(F.photo)
 async def handle_screenshot_ai(message: types.Message, state: FSMContext):
-    if not GEMINI_KEY:
-        await message.answer("⚠️ ИИ-обработка временно недоступна (не настроен API Key).")
-        return
-
     data = await state.get_data()
     match_id = data.get("active_match_id")
+
+    if not match_id:
+        return
+
+    if not GEMINI_KEY:
+        await message.answer("⚠️ ИИ-обработка временно недоступна (не настроен GEMINI_API_KEY).")
+        return
 
     await message.answer("🤖 **ИИ-Арбитр анализирует скриншот матча...** Подождите пару секунд.")
 
@@ -409,20 +552,19 @@ async def handle_screenshot_ai(message: types.Message, state: FSMContext):
         model = genai.GenerativeModel('gemini-1.5-flash')
         prompt = (
             "Проанализируй скриншот результатов матча Standoff 2. "
-            "Ответь строго в формате JSON без кавычек markdown:\n"
-            "{\"winner_score\": 13, \"loser_score\": 9, \"mvp_nick\": \"ник_mvp\", \"players\": [{\"nick\": \"ник\", \"kills\": 15, \"deaths\": 5}]}"
+            "Выдели победителя и напиши итоговый счет. Верни ответ в понятном виде."
         )
         
         image_part = {"mime_type": "image/jpeg", "data": photo_bytes.read()}
         response = model.generate_content([prompt, image_part])
         
-        await message.answer(f"📊 **Результат обработки ИИ:**\n```json\n{response.text}\n```\n Elo зачислено клану-победителю!", parse_mode="Markdown")
+        await message.answer(f"📊 **Анализ матча от ИИ-Арбитра:**\n\n{response.text}", parse_mode="Markdown")
         await state.clear()
     except Exception as e:
         logging.error(f"Ошибка ИИ Gemini: {e}")
-        await message.answer("⚠️ Не удалось автоматически прочесть скриншот. Жалоба отправлена Администратору.")
+        await message.answer("⚠️ Не удалось автоматически прочесть скриншот. Запрос передан Администратору.")
         if ADMIN_ID != 0:
-            await safe_send_message(bot, ADMIN_ID, f"🚨 **Ошибка распознавания скрина!** Match ID: `{match_id}`")
+            await safe_send_message(bot, ADMIN_ID, f"🚨 **Ошибка чтения скрина!** Match ID: `{match_id}`")
 
 # --- ВЕБ-СЕРВЕР ---
 async def handle(request):
