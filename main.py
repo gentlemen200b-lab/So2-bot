@@ -2,9 +2,9 @@ import asyncio
 import logging
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
+from aiohttp import web
 
-# Вставь сюда токен от @BotFather
-TOKEN = "8878586697:AAGcrlCXBMqSvnSLMQlBZM7asiqC2MPcmss"
+TOKEN = "8878586697:AAGcr1CXBMqSvnSLMQ1B2..." # твой полный токен
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
@@ -12,12 +12,23 @@ dp = Dispatcher()
 @dp.message(Command("start"))
 async def start_cmd(message: types.Message):
     await message.answer(
-        "👋 Привет! Я бот проекта «Битва богов» для Standoff 2!\n\n"
-        "Скоро здесь будет доступен функционал анализа матчей, подсчета рейтинга и проведения турниров."
+        "👋 Привет! Я бот проекта «Битва».\n"
+        "Скоро здесь будет доступен функционал!"
     )
+
+async def handle(request):
+    return web.Response(text="Bot is running!")
 
 async def main():
     logging.basicConfig(level=logging.INFO)
+    
+    app = web.Application()
+    app.router.add_get("/", handle)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", 10000)
+    await site.start()
+    
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
