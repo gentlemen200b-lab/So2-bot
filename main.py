@@ -92,6 +92,17 @@ def init_db():
         )
     """)
 
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS pending_matches (
+            verification_id TEXT PRIMARY KEY,
+            match_id TEXT,
+            winner_clan_id INTEGER,
+            loser_clan_id INTEGER,
+            map_name TEXT,
+            submitted_by INTEGER
+        )
+    """)
+
     conn.commit()
     conn.close()
 
@@ -969,11 +980,10 @@ async def send_veto_turn(match_id):
             f"🗺 Игровая карта: **{final_map}**\n"
             f"🏰 Создает лобби (Хостер): **[{m['host_tag']}] {m['host_name']}**\n"
             f"🆔 **Игровой ID хостера:** `{m['host_game_id']}`\n\n"
-            f"Заходите в лобби Standoff 2. После игры нажмите кнопку ниже и пришлите скриншот результатов!"
+            f"Заходите в лобби Standoff 2. После игры нажмите кнопку ниже и пришлите скриншот результатов на верификацию!"
         )
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📸 Отправить скриншот", callback_data=f"upscreen_{match_id}")],
-            [InlineKeyboardButton(text="⚠️ Пожаловаться", callback_data=f"rep_{match_id}")]
+            [InlineKeyboardButton(text="📸 Отправить скриншот на проверку", callback_data=f"upscreen_{match_id}")]
         ])
         try:
             await bot.send_message(m["p1_leader"], res_text, reply_markup=kb, parse_mode="Markdown")
@@ -1010,7 +1020,7 @@ async def handle_map_ban(call: types.CallbackQuery):
     await call.answer(f"Карта {map_name} успешно забанена!")
     await send_veto_turn(match_id)
 
-# --- ОТПРАВКА СКРИНШОТА НАПРЯМУЮ АДМИНУ ---
+# --- НОВАЯ СИСТЕМА ВЕРИФИКАЦИИ СКРИНШОТОВ ЧЕРЕЗ АДМИНА ---
 @dp.callback_query(F.data.startswith("upscreen_"))
 async def trigger_screen_upload(call: types.CallbackQuery, state: FSMContext):
     match_id = call.data.split("_")[1]
@@ -1020,7 +1030,7 @@ async def trigger_screen_upload(call: types.CallbackQuery, state: FSMContext):
         return
 
     await state.update_data(active_match_id=match_id)
-    await call.message.answer("📸 Пришлите **скриншот таблицы результатов** из Standoff 2 ответным сообщением:", reply_markup=cancel_keyboard())
+    await call.message.answer("📸 Пришлите **скриншот таблицы результатов** из Standoff 2. Он будет отправлен администратору на верификацию:", reply_markup=cancel_keyboard())
     await state.set_state(MatchResultState.waiting_for_screenshot)
     await call.answer()
 
@@ -1039,20 +1049,152 @@ async def receive_match_screenshot(message: types.Message, state: FSMContext):
     c2 = get_clan(m["c2_id"])
     photo = message.photo[-1]
 
+    verification_id = generate_short_id()
+
+    conn = sqlite3.connect("database.db")
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO pending_matches (verification_id, match_id, winner_clan_id, loser_clan_id, map_name, submitted_by)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (verification_id, match_id, c1[0], c2[0], m.get("final_map", "Не указана"), message.from_user.id))
+    conn.commit()
+    conn.close()
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"✅ Победил [{c1[1]}]", callback_data=f"verify_win_{verification_id}_{c1[0]}")],
+        [InlineKeyboardButton(text=f"✅ Победил [{c2[1]}]", callback_data=f"verify_win_{verification_id}_{c2[0]}")],
+        [InlineKeyboardButton(text="❌ Отклонить результат", callback_data=f"verify_deny_{verification_id}")]
+    ])
+
     caption = (
-        f"📸 **НОВЫЙ СКРИНШОТ ИГРОВОГО МАТЧА**\n\n"
+        f"📋 **НОВЫЙ ОТЧЕТ НА ВЕРИФИКАЦИЮ МАТЧА**\n\n"
         f"🛡 **{c1[2]}** `[{c1[1]}]` vs **{c2[2]}** `[{c2[1]}]`\n"
         f"🗺 Карта: `{m.get('final_map', 'Не указана')}`\n"
-        f"👤 Отправил капитан: `{message.from_user.full_name}` (ID: `{message.from_user.id}`)"
+        f"👤 Отправил капитан: `{message.from_user.full_name}` (ID: `{message.from_user.id}`)\n\n"
+        f"Проверьте скриншот и выберите команду-победителя:"
     )
 
     try:
-        # Пересылаем скриншот напрямую тебе (админу)
-        await bot.send_photo(ADMIN_ID, photo=photo.file_id, caption=caption, parse_mode="Markdown")
-        await message.answer("✅ Скриншот успешно отправлен администратору!", reply_markup=main_keyboard(message.from_user.id))
+        await bot.send_photo(ADMIN_ID, photo=photo.file_id, caption=caption, reply_markup=kb, parse_mode="Markdown")
+        await message.answer("✅ Скриншот успешно отправлен администратору на верификацию! Ожидайте подтверждения.", reply_markup=main_keyboard(message.from_user.id))
     except Exception as e:
         logging.error(f"Не удалось отправить скриншот админу: {e}")
         await message.answer("⚠️ Ошибка отправки администратору.", reply_markup=main_keyboard(message.from_user.id))
+
+@dp.callback_query(F.data.startswith("verify_win_"))
+async def admin_verify_win(call: types.CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        await call.answer("⚠️ Доступно только администратору!", show_alert=True)
+        return
+
+    _, _, verification_id, winner_id = call.data.split("_")
+    winner_id = int(winner_id)
+
+    conn = sqlite3.connect("database.db")
+    cur = conn.cursor()
+    cur.execute("SELECT match_id, winner_clan_id, loser_clan_id, map_name FROM pending_matches WHERE verification_id = ?", (verification_id,))
+    row = cur.fetchone()
+
+    if not row:
+        conn.close()
+        await call.answer("⚠️ Этот матч уже верифицирован или удален.", show_alert=True)
+        return
+
+    match_id, c1_id, c2_id, map_name = row
+    loser_id = c2_id if winner_id == c1_id else c1_id
+
+    # Начисление Elo
+    cur.execute("SELECT elo, wins, streak, leader_id FROM clans WHERE clan_id = ?", (winner_id,))
+    w_data = cur.fetchone()
+    cur.execute("SELECT elo, losses, streak, leader_id FROM clans WHERE clan_id = ?", (loser_id,))
+    l_data = cur.fetchone()
+
+    if w_data and l_data:
+        w_elo, w_wins, w_streak, w_leader = w_data
+        l_elo, l_losses, l_streak, l_leader = l_data
+
+        new_w_elo = w_elo + 25
+        new_l_elo = max(0, l_elo - 25)
+
+        cur.execute("UPDATE clans SET elo = ?, wins = wins + 1, streak = streak + 1 WHERE clan_id = ?", (new_w_elo, winner_id))
+        cur.execute("UPDATE clans SET elo = ?, losses = losses + 1, streak = 0 WHERE clan_id = ?", (new_l_elo, loser_id))
+
+        # Запись в историю для игроков кланов
+        cur.execute("SELECT nickname FROM clans c JOIN players p ON p.clan_id = c.clan_id WHERE c.clan_id = ?", (loser_id,))
+        opp_row = cur.fetchone()
+        opp_nick = opp_row[0] if opp_row else "Соперник"
+
+        cur.execute("SELECT user_id FROM players WHERE clan_id = ?", (winner_id,))
+        for (u_id,) in cur.fetchall():
+            cur.execute("INSERT INTO match_history (user_id, opponent_nick, map_name, result, elo_change) VALUES (?, ?, ?, ?, ?)",
+                        (u_id, opp_nick, map_name, "ПОБЕДА", 25))
+
+        cur.execute("SELECT nickname FROM clans c JOIN players p ON p.clan_id = c.clan_id WHERE c.clan_id = ?", (winner_id,))
+        w_opp_row = cur.fetchone()
+        w_opp_nick = w_opp_row[0] if w_opp_row else "Соперник"
+
+        cur.execute("SELECT user_id FROM players WHERE clan_id = ?", (loser_id,))
+        for (u_id,) in cur.fetchall():
+            cur.execute("INSERT INTO match_history (user_id, opponent_nick, map_name, result, elo_change) VALUES (?, ?, ?, ?, ?)",
+                        (u_id, w_opp_nick, map_name, "ПОРАЖЕНИЕ", -25))
+
+    cur.execute("DELETE FROM pending_matches WHERE verification_id = ?", (verification_id,))
+    conn.commit()
+    conn.close()
+
+    matches.pop(match_id, None)
+
+    admin_name = call.from_user.full_name
+    winner_clan_info = get_clan(winner_id)
+    winner_tag = winner_clan_info[1] if winner_clan_info else "Команда"
+
+    new_caption = (
+        f"{call.message.caption}\n\n"
+        f"-------------------\n"
+        f"🏆 Победитель: **[{winner_tag}]**\n"
+        f"👨‍⚖️ Проверил: {admin_name}"
+    )
+
+    await call.message.edit_caption(
+        caption=new_caption,
+        reply_markup=None,
+        parse_mode="Markdown"
+    )
+    await call.answer("Результат успешно подтвержден и очки начислены!")
+
+    try:
+        if w_data and l_data:
+            await bot.send_message(w_data[3], f"🎉 Администратор подтвердил вашу **победу** на карте `{map_name}`! (+25 Elo)")
+            await bot.send_message(l_data[3], f"🔴 Администратор подтвердил поражение вашего клана на карте `{map_name}`. (-25 Elo)")
+    except Exception:
+        pass
+
+@dp.callback_query(F.data.startswith("verify_deny_"))
+async def admin_verify_deny(call: types.CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        await call.answer("⚠️ Доступно только администратору!", show_alert=True)
+        return
+
+    verification_id = call.data.split("_")[2]
+
+    conn = sqlite3.connect("database.db")
+    cur = conn.cursor()
+    cur.execute("SELECT match_id, submitted_by FROM pending_matches WHERE verification_id = ?", (verification_id,))
+    row = cur.fetchone()
+    cur.execute("DELETE FROM pending_matches WHERE verification_id = ?", (verification_id,))
+    conn.commit()
+    conn.close()
+
+    if row:
+        match_id, submitted_by = row
+        matches.pop(match_id, None)
+        try:
+            await bot.send_message(submitted_by, "❌ Администратор отклонил результаты вашего матча. Пожалуйста, проверьте скриншот и повторите попытку.")
+        except Exception:
+            pass
+
+    await call.message.edit_caption(caption=call.message.caption + "\n\n❌ **МАТЧ ОТКЛОНЕН АДМИНИСТРАТОРОМ.**", reply_markup=None)
+    await call.answer("Результат отклонен.")
 
 # --- ИСТОРИЯ И ТОП ---
 @dp.message(F.text == "📜 История матчей")
@@ -1272,3 +1414,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
